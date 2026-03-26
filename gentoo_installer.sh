@@ -1,0 +1,1226 @@
+#!/usr/bin/env bash
+# gentoo_installer.sh
+#
+# Gentoo UEFI + mdadm RAID root installer (systemd / hardened-systemd stage3).
+# Supports PROFILE_TARGET:
+#   server|desktop|gnome|plasma|xfce|hardened|hardened-gnome|hardened-plasma|hardened-xfce
+#
+# Key:
+# - FULL rerunnable phases via state file
+# - Fixes ERR-trap boolean-test crash by never running standalone [[ ... ]] in run_step()
+# - Fixes dracut tmpdir leak by env -i in chroot + TMPDIR=/var/tmp
+# - Forces initramfs output to /boot/initramfs-<kver>.img
+# - Root password defaults to FIRST_USER_PASSWORD
+# - Prints SAFE TO REBOOT readiness report
+#
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# =============================================================================
+# TOP CONFIGS
+# =============================================================================
+
+: "${ARMED:=YES}"
+: "${WIPE_DISKS:=YES}"
+: "${DISK_A:=/dev/sda}"
+: "${DISK_B:=/dev/sdb}"
+: "${TARGET:=/mnt/gentoo}"
+: "${MD:=/dev/md0}"
+: "${ROOT_RAID_LEVEL:=raid0}"        # raid0|raid1
+: "${ROOT_FS:=ext4}"                 # ext4
+: "${EFI_SIZE_MIB:=512}"
+: "${SWAP_SIZE_GB:=16}"
+: "${RESUME:=YES}"
+
+: "${CONFIRM_ERASE:=ERASE-$(basename "$DISK_A")-$(basename "$DISK_B")}"
+
+: "${STAGE3:=}"
+: "${STAGE3_FLAVOR_AUTO:=YES}"
+: "${STAGE3_FLAVOR:=systemd}"        # systemd|hardened-systemd
+: "${STAGE3_AUTOBUILDS_BASE:=https://distfiles.gentoo.org/releases/amd64/autobuilds}"
+
+: "${PROFILE_TARGET:=hardened-plasma}"
+
+: "${GUI_ENABLE:=YES}"               # YES/NO
+: "${GUI_FLAVOR:=plasma}"            # plasma|gnome|xfce
+: "${GUI_ENABLE_NETWORKMANAGER:=YES}"
+
+: "${MAKE_JOBS_DEFAULT:=8}"
+: "${NODE_JOBS:=2}"
+: "${ACCEPT_LICENSE:=*}"
+: "${VIDEO_CARDS:=intel nvidia amdgpu nouveau}"
+: "${INPUT_DEVICES:=libinput}"
+
+: "${FIRST_USER_ENABLE:=YES}"
+: "${FIRST_USER_NAME:=sentinel}"
+: "${FIRST_USER_PASSWORD:=}"         # empty => interactive
+: "${ROOT_PASSWORD:=${FIRST_USER_PASSWORD}}"
+: "${PASSWD_ALWAYS_SET:=YES}"
+: "${FIRST_USER_GROUPS:=wheel,audio,video,usb,plugdev,portage}"
+: "${FIRST_USER_SHELL:=/bin/bash}"
+: "${SUDO_WHEEL_NOPASSWD:=NO}"
+
+: "${KERNEL_CMDLINE_OVERRIDE:=}"
+
+: "${AUTO_MERGE_PORTAGE_CFGS:=YES}"
+: "${CONFIG_PROTECT_MASK_PORTAGE:=YES}"
+: "${BREAK_CIRCULAR_DEPS_TIFF_WEBP:=YES}"
+: "${BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE:=YES}"
+: "${INSTALL_FIRMWARE:=YES}"
+: "${INSTALL_SERVER_STACK:=YES}"
+: "${INSTALL_NODE:=NO}"
+
+: "${GRUB_INSTALL_TO_DISK_B:=YES}"
+: "${GRUB_REMOVABLE:=NO}"
+
+: "${CHROOT_DEBUG:=NO}"
+: "${CHROOT_TMPDIR:=/var/tmp}"
+
+: "${LOG_DIR:=}"
+: "${LOG_BASENAME:=gentoo_install}"
+: "${LOG_ROTATE_MB:=25}"
+: "${RO_CHECK_INTERVAL:=15}"
+
+# =============================================================================
+# Logging / errors / state
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+auto_pick_log_dir() {
+  local -a candidates=("$SCRIPT_DIR" "$SCRIPT_DIR/logs" "$SCRIPT_DIR/../logs" "/tmp")
+  local d
+  for d in "${candidates[@]}"; do
+    d="$(cd "$d" 2>/dev/null && pwd -P)" || continue
+    mkdir -p "$d" 2>/dev/null || continue
+    [[ -w "$d" ]] || continue
+    echo "$d"
+    return 0
+  done
+  echo "/tmp"
+}
+
+if [[ -z "${LOG_DIR}" ]]; then
+  LOG_DIR="$(auto_pick_log_dir)"
+fi
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+LOG="${LOG_DIR}/${LOG_BASENAME}.log"
+STATE="${LOG_DIR}/${LOG_BASENAME}.state"
+STAGE3_CACHE_DIR="${LOG_DIR}/stage3-cache"
+mkdir -p "$STAGE3_CACHE_DIR" 2>/dev/null || true
+
+HOST_TMPDIR="$LOG_DIR"
+export TMPDIR="/tmp"
+
+rotate_log_if_needed() {
+  local f="$1" max_mb="$2"
+  [[ -f "$f" ]] || return 0
+  local sz=0
+  sz="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+  if (( sz > max_mb * 1024 * 1024 )); then
+    local ts; ts="$(date +%Y%m%d%H%M%S)"
+    mv -f "$f" "${f}.${ts}" 2>/dev/null || true
+    command -v gzip >/dev/null 2>&1 && gzip -9 "${f}.${ts}" >/dev/null 2>&1 || true
+  fi
+}
+rotate_log_if_needed "$LOG" "$LOG_ROTATE_MB"
+
+touch "$LOG" "$STATE" 2>/dev/null || true
+chmod 600 "$LOG" "$STATE" 2>/dev/null || true
+exec > >(tee -a "$LOG" 2>/dev/null || cat) 2>&1
+
+die(){ echo "FATAL: $*" >&2; exit 1; }
+
+on_err(){
+  local ec=$?
+  local line=${BASH_LINENO[0]:-?}
+  local cmd=${BASH_COMMAND:-?}
+  echo
+  echo "==================== INSTALLER CRASH ===================="
+  echo "Exit code : $ec"
+  echo "Line      : $line"
+  echo "Command   : $cmd"
+  echo "Log       : $LOG"
+  echo "State     : $STATE"
+  echo "========================================================="
+  echo
+  exit "$ec"
+}
+trap on_err ERR
+
+phase(){ echo; echo "===== PHASE: $* ====="; }
+
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+disk_base(){ basename "$1"; }
+
+init_state(){ touch "$STATE" 2>/dev/null || true; chmod 600 "$STATE" 2>/dev/null || true; }
+
+step_done(){
+  [[ "${RESUME:-NO}" == "YES" ]] || return 1
+  grep -qE "^DONE[[:space:]]+$1([[:space:]]|$)" "$STATE" 2>/dev/null
+}
+
+mark_done(){ printf "DONE %s %s\n" "$1" "$(date -Is)" >> "$STATE" 2>/dev/null || true; }
+
+# IMPORTANT: Never do standalone [[ ... ]] here (it can trip ERR trap).
+run_step(){
+  local s="${1:?missing step name}"
+  shift || true
+
+  local always=0
+  if [[ "$s" == "passwd" && "${PASSWD_ALWAYS_SET:-NO}" == "YES" && -n "${ROOT_PASSWORD:-}" ]]; then
+    always=1
+  fi
+
+  if [[ "$always" == "0" ]]; then
+    if step_done "$s"; then
+      echo "==> SKIP: $s"
+      return 0
+    fi
+  fi
+
+  echo "==> RUN : $s"
+  "$@"
+  echo "==> OK  : $s"
+
+  if [[ "$always" == "0" ]]; then
+    mark_done "$s"
+  fi
+}
+
+truncate_state_from_phase(){
+  local target="${1:?missing phase}"
+  [[ -f "$STATE" ]] || return 0
+
+  local tmp found=0
+  tmp="$(mktemp -p "$HOST_TMPDIR" "${LOG_BASENAME}.state.XXXXXX")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" =~ ^DONE[[:space:]]+$target([[:space:]]|$) ]]; then found=1; break; fi
+    printf '%s\n' "$line" >> "$tmp" 2>/dev/null || break
+  done < "$STATE"
+
+  if [[ "$found" -eq 1 ]]; then
+    cp -a "$tmp" "$STATE" 2>/dev/null || true
+    echo "STATE TRUNCATED: removed $target and later entries"
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+}
+
+# =============================================================================
+# Watchdog
+# =============================================================================
+
+RO_WATCHDOG_PID=""
+ro_watchdog(){
+  while true; do
+    sleep "$RO_CHECK_INTERVAL" || true
+    if mountpoint -q "$TARGET"; then
+      local opts; opts="$(findmnt -n -o OPTIONS "$TARGET" 2>/dev/null || true)"
+      if echo "$opts" | grep -qE '(^|,)ro(,|$)'; then
+        echo; echo "!!! READ-ONLY MOUNT on $TARGET !!!"
+        findmnt "$TARGET" || true
+        dmesg -T | tail -n 200 || true
+        exit 88
+      fi
+    fi
+  done
+}
+start_watchdog(){ phase "watchdog:start"; ro_watchdog & RO_WATCHDOG_PID=$!; echo "Watchdog PID: $RO_WATCHDOG_PID"; }
+stop_watchdog(){ phase "watchdog:stop"; kill "$RO_WATCHDOG_PID" 2>/dev/null || true; wait "$RO_WATCHDOG_PID" 2>/dev/null || true; }
+
+# =============================================================================
+# Preflight
+# =============================================================================
+
+check_internet(){
+  phase "preflight:internet"
+  wget -q --spider --timeout=10 https://www.gentoo.org 2>/dev/null \
+    || curl -sSf --connect-timeout 10 -o /dev/null https://www.gentoo.org 2>/dev/null \
+    || die "No internet connection detected."
+  echo "Internet connectivity OK"
+}
+
+resolve_stage3(){
+  [[ -n "${STAGE3:-}" ]] && return 0
+
+  phase "preflight:stage3_resolve"
+
+  if [[ "${STAGE3_FLAVOR_AUTO:-NO}" == "YES" ]]; then
+    if [[ "${PROFILE_TARGET:-}" == hardened* ]]; then
+      STAGE3_FLAVOR="hardened-systemd"
+    else
+      STAGE3_FLAVOR="systemd"
+    fi
+  fi
+
+  local idx_url="${STAGE3_AUTOBUILDS_BASE}/latest-stage3-amd64-${STAGE3_FLAVOR}.txt"
+  local tmp="${STAGE3_CACHE_DIR}/latest-stage3-amd64-${STAGE3_FLAVOR}.txt"
+
+  wget -qO "$tmp" "$idx_url" || die "Failed fetching: $idx_url"
+  local rel
+  rel="$(grep -vE '^(#|$)' "$tmp" | head -n1 | awk '{print $1}')"
+  [[ -n "$rel" ]] || die "Could not parse stage3 path from $idx_url"
+  STAGE3="${STAGE3_AUTOBUILDS_BASE}/${rel}"
+
+  echo "Stage3 flavor : $STAGE3_FLAVOR"
+  echo "Latest stage3 : $STAGE3"
+  echo "Log  : $LOG"
+  echo "State: $STATE"
+  echo "Disks: $DISK_A $DISK_B  RAID: $MD  Target: $TARGET  RAID_LEVEL: $ROOT_RAID_LEVEL"
+  echo "PROFILE_TARGET: $PROFILE_TARGET"
+  echo "GUI_ENABLE: $GUI_ENABLE  GUI_FLAVOR: $GUI_FLAVOR"
+  echo "RESUME: $RESUME"
+}
+
+refuse_dangerous_disks(){
+  local root_src root_pk
+  root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  [[ -n "$root_src" ]] || die "Cannot determine current root device"
+  root_pk="$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)"
+  if [[ -n "$root_pk" ]]; then
+    [[ "/dev/$root_pk" != "$DISK_A" ]] || die "Refusing: DISK_A appears to back current /"
+    [[ "/dev/$root_pk" != "$DISK_B" ]] || die "Refusing: DISK_B appears to back current /"
+  fi
+}
+
+confirm_destroy(){
+  echo
+  echo "THIS WILL DESTROY ALL DATA ON:"
+  echo "  $DISK_A  ($(lsblk -dn -o MODEL,SERIAL,SIZE "$DISK_A" 2>/dev/null || true))"
+  echo "  $DISK_B  ($(lsblk -dn -o MODEL,SERIAL,SIZE "$DISK_B" 2>/dev/null || true))"
+  echo
+  echo "Type: I_UNDERSTAND"
+  read -r ans
+  [[ "$ans" == "I_UNDERSTAND" ]] || die "Not confirmed"
+}
+
+require_inputs(){
+  [[ "${ARMED:-NO}" == "YES" ]] || die "Set ARMED=YES"
+  [[ "${WIPE_DISKS:-NO}" == "YES" ]] || die "Set WIPE_DISKS=YES"
+  [[ -b "$DISK_A" ]] || die "Disk not found: $DISK_A"
+  [[ -b "$DISK_B" ]] || die "Disk not found: $DISK_B"
+  [[ "$DISK_A" != "$DISK_B" ]] || die "DISK_A and DISK_B must differ"
+  [[ -n "${STAGE3:-}" ]] || die "STAGE3 is empty"
+  local expect="ERASE-$(disk_base "$DISK_A")-$(disk_base "$DISK_B")"
+  [[ "${CONFIRM_ERASE:-}" == "$expect" ]] || die "Set CONFIRM_ERASE=$expect"
+}
+
+# =============================================================================
+# Disk / RAID
+# =============================================================================
+
+preflight_cleanup(){
+  phase "preflight_cleanup"
+  umount -R "$TARGET" 2>/dev/null || true
+  swapoff -a 2>/dev/null || true
+  for md in /dev/md*; do
+    [[ -b "$md" ]] || continue
+    mdadm --stop "$md" 2>/dev/null || true
+    mdadm --remove "$md" 2>/dev/null || true
+  done
+  udevadm settle 2>/dev/null || true
+}
+
+step_time(){ phase "time"; echo "Time now: $(date -Is)"; }
+
+step_wipe(){
+  phase "wipe"
+  refuse_dangerous_disks
+  confirm_destroy
+  preflight_cleanup
+  for d in "$DISK_A" "$DISK_B"; do
+    sgdisk --zap-all "$d" || true
+    sgdisk -o "$d" || true
+    wipefs -a "$d" || true
+    partprobe "$d" 2>/dev/null || true
+  done
+  udevadm settle || true
+}
+
+step_partition(){
+  phase "partition"
+  local efi_end="+${EFI_SIZE_MIB}MiB"
+  for d in "$DISK_A" "$DISK_B"; do
+    sgdisk -Z "$d" || true
+    sgdisk -o "$d"
+    sgdisk -n "1:0:${efi_end}" -t "1:EF00" -c "1:EFI" "$d"
+    sgdisk -n "2:0:0"          -t "2:FD00" -c "2:RAIDROOT" "$d"
+  done
+  partprobe "$DISK_A" "$DISK_B" 2>/dev/null || true
+  udevadm settle || true
+}
+
+min_member_kib(){
+  local a b minb
+  a="$(blockdev --getsize64 "${DISK_A}2")"
+  b="$(blockdev --getsize64 "${DISK_B}2")"
+  [[ -n "$a" && -n "$b" ]] || die "blockdev size failed"
+  minb="$a"; (( b < minb )) && minb="$b"
+  echo $(( minb / 1024 ))
+}
+
+wipe_member_signatures(){
+  mdadm --stop "$MD" 2>/dev/null || true
+  mdadm --remove "$MD" 2>/dev/null || true
+  mdadm --zero-superblock --force "${DISK_A}2" "${DISK_B}2" 2>/dev/null || true
+  wipefs -a "${DISK_A}2" "${DISK_B}2" 2>/dev/null || true
+  udevadm settle 2>/dev/null || true
+}
+
+mdadm_supports(){ mdadm --help 2>/dev/null | grep -qE "$1"; }
+
+mdadm_create_attempt(){
+  local level="$1" raid_devs="$2" bitmap_arg="$3" size_kib="$4"
+
+  if mdadm_supports '(^|[[:space:]])--yes($|[[:space:]])'; then
+    mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
+      --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force --yes "${DISK_A}2" "${DISK_B}2"
+    return $?
+  fi
+  if mdadm_supports '(^|[[:space:]])-y($|[[:space:]])'; then
+    mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
+      --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force -y "${DISK_A}2" "${DISK_B}2"
+    return $?
+  fi
+
+  local rc
+  set +o pipefail
+  yes | mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
+    --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force "${DISK_A}2" "${DISK_B}2"
+  rc=$?
+  set -o pipefail
+
+  if [[ "$rc" -eq 0 || "$rc" -eq 141 ]]; then
+    [[ -b "$MD" ]] && return 0
+  fi
+  return "$rc"
+}
+
+mdadm_create_with_retry(){
+  local level="$1" raid_devs="$2" bitmap_arg="$3"
+  local base_kib; base_kib="$(min_member_kib)"
+  local margins=(0 262144 524288 1048576 2097152 4194304 8388608)
+
+  for m in "${margins[@]}"; do
+    local size_kib=$(( base_kib - m ))
+    [[ "$size_kib" -gt 1024 ]] || continue
+    wipe_member_signatures
+    if mdadm_create_attempt "$level" "$raid_devs" "$bitmap_arg" "$size_kib"; then
+      mdadm --detail "$MD" >/dev/null 2>&1 || die "mdadm created but cannot detail $MD"
+      echo "mdadm: create succeeded with size_kib=$size_kib"
+      return 0
+    fi
+    echo "mdadm: create failed with size_kib=$size_kib (trying smaller)"
+    mdadm --stop "$MD" 2>/dev/null || true
+  done
+  die "mdadm create failed after retries"
+}
+
+step_mkfsraid(){
+  phase "mkfsraid"
+  preflight_cleanup
+
+  mkfs.vfat -F32 "${DISK_A}1"
+  mkfs.vfat -F32 "${DISK_B}1"
+
+  local level raid_devs bitmap_arg=""
+  case "$ROOT_RAID_LEVEL" in
+    raid0) level=0; raid_devs=2 ;;
+    raid1) level=1; raid_devs=2; bitmap_arg="--bitmap=internal" ;;
+    *) die "ROOT_RAID_LEVEL must be raid0 or raid1" ;;
+  esac
+
+  mdadm_create_with_retry "$level" "$raid_devs" "$bitmap_arg"
+
+  case "$ROOT_FS" in
+    ext4) mkfs.ext4 -F "$MD" ;;
+    *) die "ROOT_FS unsupported: $ROOT_FS" ;;
+  esac
+}
+
+# =============================================================================
+# Mount / stage3 / chroot
+# =============================================================================
+
+ensure_md_present(){
+  [[ -b "$MD" ]] && return 0
+  mdadm --assemble --scan || true
+  [[ -b "$MD" ]] || die "RAID device missing: $MD"
+}
+
+ensure_target_mounted(){
+  phase "ensure:mount"
+  ensure_md_present
+
+  mkdir -p "$TARGET"
+  mountpoint -q "$TARGET" || mount "$MD" "$TARGET"
+
+  mkdir -p "$TARGET/boot/efi" "$TARGET/boot/efi2" "$TARGET/efi" "$TARGET/efi2"
+  mountpoint -q "$TARGET/boot/efi"  || mount "${DISK_A}1" "$TARGET/boot/efi"
+  mountpoint -q "$TARGET/boot/efi2" || mount "${DISK_B}1" "$TARGET/boot/efi2" || true
+
+  mountpoint -q "$TARGET/efi"  || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
+  mountpoint -q "$TARGET/efi2" || mount --bind "$TARGET/boot/efi2" "$TARGET/efi2" || true
+}
+
+stage3_cache_path(){ echo "${STAGE3_CACHE_DIR}/$(basename "$STAGE3")"; }
+
+fetch_stage3_if_needed(){
+  mkdir -p "$STAGE3_CACHE_DIR" 2>/dev/null || true
+  local dst; dst="$(stage3_cache_path)"
+  if [[ -s "$dst" ]]; then
+    return 0
+  fi
+  phase "ensure:stage3_fetch"
+  echo "Downloading Stage3 -> $dst"
+  wget -O "$dst" "$STAGE3" || die "Stage3 download failed"
+}
+
+ensure_stage3_present(){
+  phase "ensure:stage3"
+  ensure_target_mounted
+  [[ -x "$TARGET/bin/bash" ]] && return 0
+  fetch_stage3_if_needed
+  local tarball; tarball="$(stage3_cache_path)"
+  ( cd "$TARGET" && tar xpf "$tarball" --xattrs-include='*.*' --numeric-owner ) || die "Stage3 extraction failed"
+  [[ -x "$TARGET/bin/bash" ]] || die "Stage3 extraction failed: bash missing"
+}
+
+ensure_chrootprep(){
+  phase "ensure:chroot"
+  ensure_stage3_present
+  ensure_target_mounted
+
+  mkdir -p "$TARGET/tmp" "$TARGET/var/tmp"
+  mkdir -p "$TARGET"/{proc,sys,dev,run,etc,root,home,usr,boot,boot/grub,boot/efi,boot/efi2,efi,efi2,var/db/repos,etc/portage/repos.conf,etc/portage/package.use,etc/portage/package.accept_keywords,etc/portage/package.unmask,etc/portage/package.env,etc/portage/env,etc/dracut.conf.d,etc/kernel,etc/kernel/install.d} || true
+  cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || true
+
+  mountpoint -q "$TARGET/proc" || mount -t proc /proc "$TARGET/proc"
+  mountpoint -q "$TARGET/sys"  || { mount --rbind /sys "$TARGET/sys"; mount --make-rslave "$TARGET/sys"; }
+  mountpoint -q "$TARGET/dev"  || { mount --rbind /dev "$TARGET/dev"; mount --make-rslave "$TARGET/dev"; }
+  mountpoint -q "$TARGET/run"  || { mount --rbind /run "$TARGET/run" 2>/dev/null || true; mount --make-rslave "$TARGET/run" 2>/dev/null || true; }
+
+  mountpoint -q "$TARGET/efi"  || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
+  mountpoint -q "$TARGET/efi2" || mount --bind "$TARGET/boot/efi2" "$TARGET/efi2" || true
+}
+
+chroot_cmd(){
+  local cmd="$1"
+  ensure_chrootprep
+
+  local -a base_env=(
+    "HOME=/root"
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "TERM=${TERM:-linux}"
+    "LANG=${LANG:-C.UTF-8}"
+    "TMPDIR=${CHROOT_TMPDIR}"
+    "TMP=${CHROOT_TMPDIR}"
+    "TEMP=${CHROOT_TMPDIR}"
+    "CHROOT_DEBUG=${CHROOT_DEBUG}"
+  )
+
+  echo "CHROOT> $cmd"
+  chroot "$TARGET" /usr/bin/env -i "${base_env[@]}" /bin/bash -lc "$cmd"
+}
+
+chroot_script(){
+  local -a envs=()
+  while [[ $# -gt 0 && "$1" == *=* ]]; do envs+=("$1"); shift; done
+
+  ensure_chrootprep
+
+  local -a base_env=(
+    "HOME=/root"
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    "TERM=${TERM:-linux}"
+    "LANG=${LANG:-C.UTF-8}"
+    "TMPDIR=${CHROOT_TMPDIR}"
+    "TMP=${CHROOT_TMPDIR}"
+    "TEMP=${CHROOT_TMPDIR}"
+    "CHROOT_DEBUG=${CHROOT_DEBUG}"
+  )
+
+  local name="/root/.installer.$(date +%s).$$.$RANDOM.sh"
+  local host_path="$TARGET$name"
+  cat > "$host_path"
+  chmod 0700 "$host_path"
+
+  echo "CHROOT> (script) $name"
+  chroot "$TARGET" /usr/bin/env -i "${base_env[@]}" "${envs[@]}" /bin/bash "$name"
+  local rc=$?
+  rm -f "$host_path" 2>/dev/null || true
+  return "$rc"
+}
+
+# =============================================================================
+# Packages
+# =============================================================================
+
+PKGS_CORE=(
+  sys-kernel/gentoo-kernel-bin
+  sys-kernel/installkernel
+  sys-kernel/dracut
+  sys-fs/mdadm
+  sys-boot/grub
+  net-misc/openssh
+  app-admin/sudo
+  dev-lang/python
+)
+
+PKGS_FIRMWARE=( sys-kernel/linux-firmware )
+
+PKGS_SERVER=(
+  www-servers/apache
+  app-eselect/eselect-php
+  dev-lang/php
+  dev-db/mariadb
+  dev-db/phpmyadmin
+  net-ftp/vsftpd
+)
+
+PKGS_NODE=( net-libs/nodejs )
+
+PKGS_GUI_BASE=( x11-base/xorg-server x11-apps/xinit x11-base/xorg-drivers )
+PKGS_GUI_PLASMA=( kde-plasma/plasma-meta x11-misc/sddm )
+PKGS_GUI_GNOME=( gnome-base/gnome gnome-base/gdm )
+PKGS_GUI_XFCE=( xfce-base/xfce4-meta x11-misc/lightdm x11-misc/lightdm-gtk-greeter )
+PKGS_NET_GUI=( net-misc/networkmanager )
+
+join_space(){ local IFS=' '; echo "$*"; }
+
+# =============================================================================
+# Chroot install phases
+# =============================================================================
+
+chroot_automerge_portage_cfgs(){
+  [[ "${AUTO_MERGE_PORTAGE_CFGS:-NO}" == "YES" ]] || return 0
+  phase "install:automerge_portage_cfgs"
+  chroot_script <<'EOF'
+set -euo pipefail
+shopt -s nullglob globstar
+for f in /etc/portage/**/._cfg*; do
+  base="$(basename "$f")"
+  new="$(echo "$base" | sed -E 's/^\._cfg[0-9]+_//')"
+  dir="$(dirname "$f")"
+  [ -n "$new" ] || continue
+  dest="$dir/$new"
+  [ -e "$dest" ] && cp -a "$dest" "$dest.bak.$(date +%s)" 2>/dev/null || true
+  mv -f "$f" "$dest"
+done
+EOF
+}
+
+chroot_bootstrap_portage(){
+  phase "install:portage_bootstrap"
+  chroot_script "PROFILE_TARGET=$PROFILE_TARGET" <<'EOF'
+set -euo pipefail
+[ "${CHROOT_DEBUG:-NO}" = "YES" ] && set -x
+
+mkdir -p /etc/portage/repos.conf /var/db/repos
+
+cat > /etc/portage/repos.conf/gentoo.conf <<'EOC'
+[gentoo]
+location = /var/db/repos/gentoo
+sync-type = webrsync
+EOC
+
+emerge-webrsync
+test -d /var/db/repos/gentoo/profiles || { echo "ERROR: repo profiles missing"; exit 1; }
+
+plist="$(eselect profile list)"
+
+pick_id_path() {
+  local re="$1"
+  echo "$plist" | awk -v n="$re" '
+    $0 ~ n && $0 !~ /\/musl\// && $0 !~ /\/x32\// && $0 !~ /\/uclibc\// {
+      id=$1; path=$2;
+      gsub(/\[/,"",id); gsub(/\]/,"",id);
+      print id, path; exit 0
+    }'
+}
+
+set_profile_by_id() {
+  local id="$1"
+  [ -n "$id" ] || { echo "ERROR: empty profile id"; exit 2; }
+  eselect profile set "$id"
+  local p; p="$(readlink -f /etc/portage/make.profile 2>/dev/null || true)"
+  echo "Active profile: $p"
+  case "$p" in *"/musl/"*) echo "ERROR: musl profile selected"; exit 3 ;; esac
+  case "$p" in *"/x32/"*)  echo "ERROR: x32 profile selected";  exit 4 ;; esac
+}
+
+pick_hardened_feature_path() {
+  local d
+  for d in "features/hardened/amd64" "features/hardened"; do
+    if [ -d "/var/db/repos/gentoo/profiles/${d}" ]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  echo "features/hardened"
+}
+
+make_stacked_profile() {
+  local base_path="$1" feature_path="$2" name="$3"
+  local dir="/etc/portage/custom-profiles/$name"
+  mkdir -p "$dir"
+  printf 'gentoo:%s\ngentoo:%s\n' "$base_path" "$feature_path" > "$dir/parent"
+  ln -snf "$dir" /etc/portage/make.profile
+  local p; p="$(readlink -f /etc/portage/make.profile 2>/dev/null || true)"
+  echo "Active stacked profile: $p"
+  [ -f "$p/parent" ] && { echo "Stacked parent:"; cat "$p/parent"; }
+}
+
+target="${PROFILE_TARGET:-server}"
+id=""
+path=""
+
+case "$target" in
+  server)          read -r id path < <(pick_id_path 'default/linux/amd64/.*/systemd') ;;
+  hardened)        read -r id path < <(pick_id_path 'default/linux/amd64/.*/hardened/systemd') ;;
+  desktop)         read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/systemd') ;;
+  gnome)           read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/gnome/systemd') ;;
+  plasma)          read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/plasma/systemd') ;;
+  xfce)            read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/xfce/systemd') ;;
+  hardened-gnome)
+                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/gnome/systemd')
+                   set_profile_by_id "$id"
+                   make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-gnome"
+                   id=""
+                   ;;
+  hardened-plasma)
+                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/plasma/systemd')
+                   set_profile_by_id "$id"
+                   make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-plasma"
+                   id=""
+                   ;;
+  hardened-xfce)
+                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/xfce/systemd')
+                   set_profile_by_id "$id"
+                   make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-xfce"
+                   id=""
+                   ;;
+  *) echo "ERROR: unknown PROFILE_TARGET=$target"; eselect profile list || true; exit 2 ;;
+esac
+
+if [ -n "$id" ]; then
+  set_profile_by_id "$id"
+fi
+
+cat > /etc/portage/repos.conf/gentoo.conf <<'EOC' || true
+[gentoo]
+location = /var/db/repos/gentoo
+sync-type = rsync
+sync-uri = rsync://rsync.gentoo.org/gentoo-portage
+auto-sync = yes
+EOC
+EOF
+}
+
+chroot_write_make_conf(){
+  phase "install:make.conf"
+  chroot_script \
+    "MAKE_JOBS_DEFAULT=$MAKE_JOBS_DEFAULT" \
+    "VIDEO_CARDS=$VIDEO_CARDS" \
+    "INPUT_DEVICES=$INPUT_DEVICES" \
+    "GUI_ENABLE=$GUI_ENABLE" \
+    "ACCEPT_LICENSE=$ACCEPT_LICENSE" \
+    "CONFIG_PROTECT_MASK_PORTAGE=$CONFIG_PROTECT_MASK_PORTAGE" \
+    <<'EOF'
+set -euo pipefail
+mkdir -p /etc/portage
+
+use_gui=""
+if [ "${GUI_ENABLE:-NO}" = "YES" ]; then
+  use_gui="X wayland"
+fi
+
+cat > /etc/portage/make.conf <<EOC
+COMMON_FLAGS='-O2 -pipe'
+CFLAGS="\${COMMON_FLAGS}"
+CXXFLAGS="\${COMMON_FLAGS}"
+FCFLAGS="\${COMMON_FLAGS}"
+FFLAGS="\${COMMON_FLAGS}"
+
+MAKEOPTS='-j${MAKE_JOBS_DEFAULT}'
+FEATURES='parallel-fetch'
+ACCEPT_LICENSE='${ACCEPT_LICENSE}'
+
+VIDEO_CARDS="${VIDEO_CARDS}"
+INPUT_DEVICES="${INPUT_DEVICES}"
+
+USE="\${use_gui}"
+EOC
+
+if [ "${CONFIG_PROTECT_MASK_PORTAGE:-YES}" = "YES" ]; then
+  echo 'CONFIG_PROTECT_MASK="/etc/portage"' >> /etc/portage/make.conf
+fi
+
+mkdir -p /etc/dracut.conf.d /etc/kernel /etc/kernel/install.d
+EOF
+}
+
+chroot_write_portage_overrides(){
+  phase "install:portage_overrides"
+  chroot_script \
+    "BREAK_CIRCULAR_DEPS_TIFF_WEBP=$BREAK_CIRCULAR_DEPS_TIFF_WEBP" \
+    "BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE=$BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE" \
+    "GUI_ENABLE=$GUI_ENABLE" \
+    "GUI_FLAVOR=$GUI_FLAVOR" \
+    "NODE_JOBS=$NODE_JOBS" \
+    <<'EOF'
+set -euo pipefail
+mkdir -p /etc/portage/package.use /etc/portage/package.accept_keywords /etc/portage/package.unmask /etc/portage/package.env /etc/portage/env
+
+cat > /etc/portage/package.use/zz-installer-installkernel <<'EOC'
+sys-kernel/installkernel dracut grub
+EOC
+
+cat > /etc/portage/package.use/zz-installer-python <<'EOC'
+dev-lang/python ssl sqlite
+EOC
+
+if [ "${BREAK_CIRCULAR_DEPS_TIFF_WEBP:-NO}" = "YES" ]; then
+  echo 'media-libs/tiff -webp' > /etc/portage/package.use/zz-installer-circular-tiff-webp
+fi
+
+if [ "${BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE:-NO}" = "YES" ]; then
+  echo 'dev-python/pillow -truetype' > /etc/portage/package.use/zz-installer-circular-pillow
+fi
+
+if [ "${GUI_ENABLE:-NO}" = "YES" ] && [ "${GUI_FLAVOR:-}" = "plasma" ]; then
+  cat > /etc/portage/package.use/zz-installer-plasma <<'EOC'
+dev-qt/qtbase wayland opengl
+x11-libs/libxkbcommon X
+kde-plasma/kwin lock
+EOC
+fi
+
+cat > /etc/portage/env/nodejs.conf <<EOC
+MAKEOPTS='-j${NODE_JOBS}'
+EOC
+echo 'net-libs/nodejs nodejs.conf' > /etc/portage/package.env/nodejs
+EOF
+}
+
+chroot_write_kernel_install_conf(){
+  phase "install:kernel_install_conf"
+  chroot_script "MD_DEV=$MD" "ROOT_FS=$ROOT_FS" "KERNEL_CMDLINE_OVERRIDE=$KERNEL_CMDLINE_OVERRIDE" <<'EOF'
+set -euo pipefail
+mkdir -p /etc/cmdline.d /etc/kernel /etc/kernel/install.d /etc/dracut.conf.d /boot
+
+root_uuid="$(blkid -s UUID -o value "${MD_DEV}")"
+[ -n "$root_uuid" ] || { echo "ERROR: cannot read UUID for ${MD_DEV}"; exit 1; }
+
+if [ -n "${KERNEL_CMDLINE_OVERRIDE:-}" ]; then
+  cmd="${KERNEL_CMDLINE_OVERRIDE}"
+else
+  cmd="root=UUID=${root_uuid} rootfstype=${ROOT_FS} rw rd.auto=1"
+fi
+
+printf '%s\n' "$cmd" > /etc/cmdline
+printf '%s\n' "$cmd" > /etc/cmdline.d/00-installer.conf
+printf '%s\n' "$cmd" > /etc/kernel/cmdline
+chmod 0644 /etc/cmdline /etc/cmdline.d/00-installer.conf /etc/kernel/cmdline
+
+cat > /etc/kernel/install.conf <<'EOC'
+layout=compat
+initrd_generator=dracut
+uki_generator=none
+EOC
+
+cat > /etc/dracut.conf.d/10-installer-cmdline.conf <<EOC
+kernel_cmdline="${cmd}"
+EOC
+
+cat > /etc/dracut.conf.d/99-installer.conf <<'EOC'
+add_dracutmodules+=" mdraid "
+EOC
+
+cat > /etc/kernel/install.d/05-check-chroot.install <<'EOC'
+#!/bin/sh
+exit 0
+EOC
+chmod 0755 /etc/kernel/install.d/05-check-chroot.install
+
+if [ ! -s /etc/machine-id ]; then
+  systemd-machine-id-setup >/dev/null 2>&1 || true
+fi
+EOF
+}
+
+chroot_create_swap(){
+  phase "install:swap"
+  chroot_script "SWAP_SIZE_GB=$SWAP_SIZE_GB" <<'EOF'
+set -euo pipefail
+swapfile=/swapfile
+if ! grep -q '^/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+  rm -f "$swapfile" || true
+  if ! fallocate -l "${SWAP_SIZE_GB}G" "$swapfile" 2>/dev/null; then
+    dd if=/dev/zero of="$swapfile" bs=1M count=$((SWAP_SIZE_GB*1024)) status=progress
+  fi
+  chmod 600 "$swapfile"
+  mkswap "$swapfile"
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+EOF
+}
+
+chroot_emerge_all(){
+  phase "install:emerge"
+
+  local -a pkgs=("${PKGS_CORE[@]}")
+  [[ "$INSTALL_FIRMWARE" == "YES" ]] && pkgs+=("${PKGS_FIRMWARE[@]}")
+  [[ "$INSTALL_SERVER_STACK" == "YES" ]] && pkgs+=("${PKGS_SERVER[@]}")
+  [[ "$INSTALL_NODE" == "YES" ]] && pkgs+=("${PKGS_NODE[@]}")
+
+  if [[ "$GUI_ENABLE" == "YES" ]]; then
+    pkgs+=("${PKGS_GUI_BASE[@]}")
+    [[ "$GUI_ENABLE_NETWORKMANAGER" == "YES" ]] && pkgs+=("${PKGS_NET_GUI[@]}")
+    case "$GUI_FLAVOR" in
+      plasma) pkgs+=("${PKGS_GUI_PLASMA[@]}") ;;
+      gnome)  pkgs+=("${PKGS_GUI_GNOME[@]}") ;;
+      xfce)   pkgs+=("${PKGS_GUI_XFCE[@]}") ;;
+      *) die "Unknown GUI_FLAVOR=$GUI_FLAVOR" ;;
+    esac
+  fi
+
+  local pkg_str; pkg_str="$(join_space "${pkgs[@]}")"
+
+  chroot_script "PKGS=$pkg_str" "AUTO_MERGE_PORTAGE_CFGS=$AUTO_MERGE_PORTAGE_CFGS" <<'EOF'
+set -euo pipefail
+
+merge_cfgs() {
+  shopt -s nullglob globstar
+  for f in /etc/portage/**/._cfg*; do
+    base="$(basename "$f")"
+    new="$(echo "$base" | sed -E 's/^\._cfg[0-9]+_//')"
+    dir="$(dirname "$f")"
+    [ -n "$new" ] || continue
+    dest="$dir/$new"
+    [ -e "$dest" ] && cp -a "$dest" "$dest.bak.$(date +%s)" 2>/dev/null || true
+    mv -f "$f" "$dest"
+  done
+}
+
+set +e
+emerge --resume --ask=n
+resume_rc=$?
+set -e
+if [ "$resume_rc" -eq 0 ]; then
+  exit 0
+fi
+
+attempt=1
+while true; do
+  log="/root/.emerge.$(date +%s).log"
+  set +e
+  emerge --ask=n --autounmask-write=y --autounmask-continue=y -v ${PKGS} 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  if [ "$rc" -eq 0 ]; then
+    break
+  fi
+
+  if [ "${AUTO_MERGE_PORTAGE_CFGS:-YES}" = "YES" ]; then
+    merge_cfgs
+  fi
+
+  if [ "$attempt" -ge 5 ]; then
+    exit "$rc"
+  fi
+
+  attempt=$((attempt+1))
+done
+EOF
+
+  chroot_automerge_portage_cfgs
+}
+
+chroot_kernel_deploy(){
+  phase "install:kernel_deploy"
+  chroot_script <<'EOF'
+set -euo pipefail
+if compgen -G '/var/db/pkg/sys-kernel/gentoo-kernel-bin-*' >/dev/null; then
+  emerge --config sys-kernel/gentoo-kernel-bin || true
+fi
+EOF
+}
+
+chroot_write_mdadm_fstab(){
+  phase "install:mdadm_fstab"
+  chroot_script "DISK_A=$DISK_A" "MD_DEV=$MD" "ROOT_FS=$ROOT_FS" <<'EOF'
+set -euo pipefail
+mdadm --detail --scan > /etc/mdadm.conf || true
+efi_uuid="$(blkid -s UUID -o value "${DISK_A}1")"
+root_uuid="$(blkid -s UUID -o value "${MD_DEV}")"
+cat > /etc/fstab <<EOC
+UUID=${root_uuid}  /          ${ROOT_FS}  noatime,errors=remount-ro  0 1
+UUID=${efi_uuid}   /boot/efi   vfat       umask=0077               0 2
+/swapfile          none        swap       sw                       0 0
+EOC
+EOF
+}
+
+chroot_dracut_initramfs(){
+  phase "install:initramfs"
+  chroot_script <<'EOF'
+set -euo pipefail
+mkdir -p /boot /etc/dracut.conf.d
+kver="$(ls -1 /lib/modules 2>/dev/null | sort -V | tail -n1)"
+[ -n "$kver" ] || { echo "ERROR: /lib/modules missing or empty"; exit 2; }
+out="/boot/initramfs-${kver}.img"
+dracut --force "$out" "$kver" --add mdraid
+ls -l "$out"
+EOF
+}
+
+chroot_enable_services(){
+  phase "install:services"
+  chroot_script \
+    "GUI_ENABLE=$GUI_ENABLE" \
+    "GUI_FLAVOR=$GUI_FLAVOR" \
+    "GUI_ENABLE_NETWORKMANAGER=$GUI_ENABLE_NETWORKMANAGER" \
+    "INSTALL_SERVER_STACK=$INSTALL_SERVER_STACK" \
+    <<'EOF'
+set -euo pipefail
+systemctl enable sshd || true
+
+if [ "${INSTALL_SERVER_STACK:-NO}" = "YES" ]; then
+  systemctl enable apache2 mariadb vsftpd || true
+  if systemctl list-unit-files | grep -q '^php-fpm\.service'; then
+    systemctl enable php-fpm || true
+  fi
+fi
+
+if [ "${GUI_ENABLE:-NO}" = "YES" ]; then
+  [ "${GUI_ENABLE_NETWORKMANAGER:-NO}" = "YES" ] && systemctl enable NetworkManager || true
+  case "${GUI_FLAVOR:-}" in
+    plasma) systemctl enable sddm || true ;;
+    gnome)  systemctl enable gdm || true ;;
+    xfce)   systemctl enable lightdm || true ;;
+  esac
+fi
+EOF
+}
+
+chroot_install_grub(){
+  phase "install:grub"
+  chroot_script "GRUB_REMOVABLE=$GRUB_REMOVABLE" <<'EOF'
+set -euo pipefail
+rem=""
+[ "${GRUB_REMOVABLE:-NO}" = "YES" ] && rem="--removable"
+mkdir -p /boot/grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Gentoo --recheck $rem
+grub-mkconfig -o /boot/grub/grub.cfg
+EOF
+}
+
+mirror_esp_to_disk_b(){
+  [[ "$GRUB_INSTALL_TO_DISK_B" == "YES" ]] || return 0
+  phase "install:grub_disk_b+mirror"
+  chroot_script "GRUB_REMOVABLE=$GRUB_REMOVABLE" <<'EOF'
+set -euo pipefail
+rem=""
+[ "${GRUB_REMOVABLE:-NO}" = "YES" ] && rem="--removable"
+grub-install --target=x86_64-efi --efi-directory=/boot/efi2 --bootloader-id=Gentoo --recheck $rem || true
+rsync -aHAX --delete /boot/efi/ /boot/efi2/ || true
+EOF
+}
+
+chroot_create_first_user(){
+  [[ "$FIRST_USER_ENABLE" == "YES" ]] || return 0
+  phase "install:first_user"
+  chroot_script \
+    "FIRST_USER_NAME=$FIRST_USER_NAME" \
+    "FIRST_USER_PASSWORD=$FIRST_USER_PASSWORD" \
+    "FIRST_USER_GROUPS=$FIRST_USER_GROUPS" \
+    "FIRST_USER_SHELL=$FIRST_USER_SHELL" \
+    "SUDO_WHEEL_NOPASSWD=$SUDO_WHEEL_NOPASSWD" \
+    <<'EOF'
+set -euo pipefail
+user="${FIRST_USER_NAME}"
+groups_csv="${FIRST_USER_GROUPS}"
+shell="${FIRST_USER_SHELL}"
+
+IFS=',' read -r -a groups_arr <<< "$groups_csv"
+for g in "${groups_arr[@]}"; do
+  g="$(echo "$g" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  [ -n "$g" ] || continue
+  getent group "$g" >/dev/null 2>&1 || groupadd "$g" || true
+done
+
+id "$user" >/dev/null 2>&1 || useradd -m -s "$shell" -G "$groups_csv" "$user"
+
+if [ -n "${FIRST_USER_PASSWORD:-}" ]; then
+  printf '%s:%s\n' "$user" "$FIRST_USER_PASSWORD" | chpasswd
+else
+  echo "No FIRST_USER_PASSWORD set; running passwd interactively."
+  passwd "$user"
+fi
+
+mkdir -p /etc/sudoers.d
+if [ "${SUDO_WHEEL_NOPASSWD:-NO}" = "YES" ]; then
+  echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-wheel
+else
+  echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/00-wheel
+fi
+chmod 0440 /etc/sudoers.d/00-wheel
+EOF
+}
+
+step_install(){
+  phase "install"
+  chroot_cmd "source /etc/profile && env-update || true"
+  chroot_bootstrap_portage
+  chroot_write_make_conf
+  chroot_write_portage_overrides
+  chroot_write_kernel_install_conf
+  chroot_create_swap
+  chroot_emerge_all
+  chroot_kernel_deploy
+  chroot_write_mdadm_fstab
+  chroot_dracut_initramfs
+  chroot_enable_services
+  chroot_install_grub
+  mirror_esp_to_disk_b
+  chroot_create_first_user
+}
+
+step_passwd(){
+  phase "passwd"
+  chroot_script "ROOT_PASSWORD=$ROOT_PASSWORD" "PASSWD_ALWAYS_SET=$PASSWD_ALWAYS_SET" <<'EOF'
+set -euo pipefail
+root_hash="$(awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null || true)"
+needs_set=0
+case "$root_hash" in ""|"!"*|"*"*) needs_set=1 ;; esac
+if [ "${PASSWD_ALWAYS_SET:-NO}" = "YES" ] && [ -n "${ROOT_PASSWORD:-}" ]; then
+  needs_set=1
+fi
+if [ -n "${ROOT_PASSWORD:-}" ] && [ "$needs_set" -eq 1 ]; then
+  printf 'root:%s\n' "${ROOT_PASSWORD}" | chpasswd
+  echo "ROOT password set from ROOT_PASSWORD."
+  exit 0
+fi
+if [ "$needs_set" -eq 1 ]; then
+  echo "Set ROOT password now:"
+  passwd
+fi
+EOF
+}
+
+reboot_readiness_report(){
+  local ok=1
+  local -a missing=()
+
+  mountpoint -q "$TARGET" || missing+=("target mounted: $TARGET")
+  [[ -f "$TARGET/etc/fstab" ]] || missing+=("/etc/fstab")
+  [[ -f "$TARGET/etc/mdadm.conf" ]] || missing+=("/etc/mdadm.conf")
+  [[ -f "$TARGET/boot/grub/grub.cfg" ]] || missing+=("/boot/grub/grub.cfg")
+
+  if ! ls "$TARGET/boot"/kernel-* "$TARGET/boot"/vmlinuz-* >/dev/null 2>&1; then
+    missing+=("kernel image in /boot")
+  fi
+  if ! ls "$TARGET/boot"/initramfs-* "$TARGET/boot"/initrd* "$TARGET/boot"/*.img >/dev/null 2>&1; then
+    missing+=("initramfs image in /boot")
+  fi
+
+  if [[ -f "$TARGET/etc/shadow" ]]; then
+    local root_hash
+    root_hash="$(awk -F: '$1=="root"{print $2}' "$TARGET/etc/shadow" 2>/dev/null || true)"
+    case "$root_hash" in ""|"!"*|"*"*) missing+=("root password set") ;; esac
+  else
+    missing+=("/etc/shadow")
+  fi
+
+  if [[ "${FIRST_USER_ENABLE:-NO}" == "YES" && -n "${FIRST_USER_NAME:-}" ]]; then
+    if [[ -f "$TARGET/etc/passwd" ]]; then
+      grep -qE "^${FIRST_USER_NAME}:" "$TARGET/etc/passwd" || missing+=("user exists: ${FIRST_USER_NAME}")
+    else
+      missing+=("/etc/passwd")
+    fi
+  fi
+
+  (( ${#missing[@]} == 0 )) || ok=0
+
+  echo
+  echo "===== REBOOT READINESS ====="
+  if [[ "$ok" -eq 1 ]]; then
+    echo "SAFE TO REBOOT"
+    printf '\a' || true
+  else
+    echo "NOT SAFE TO REBOOT"
+    for x in "${missing[@]}"; do
+      echo "  - $x"
+    done
+  fi
+  echo "============================"
+  echo
+}
+
+finish_msg(){
+  reboot_readiness_report
+  echo "DONE."
+  echo "Log  : $LOG"
+  echo "State: $STATE"
+  echo
+  echo "Next:"
+  echo "  umount -R $TARGET"
+  echo "  reboot"
+  echo
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main(){
+  local RESET=0 RESET_PHASE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reset) RESET=1; shift ;;
+      --reset-phase) shift; [[ $# -gt 0 ]] || die "--reset-phase requires arg"; RESET_PHASE="$1"; shift ;;
+      -h|--help)
+        echo "Usage: $0 [--reset] [--reset-phase <phase>]"
+        exit 0
+        ;;
+      *) die "Unknown arg: $1" ;;
+    esac
+  done
+
+  need_root
+  for c in sgdisk mdadm wipefs partprobe udevadm rsync tar mount umount findmnt lsblk mkfs.vfat mkfs.ext4 mktemp yes blockdev wget chroot blkid sed stat grep awk curl dd fallocate mkswap; do
+    need_cmd "$c"
+  done
+
+  check_internet
+  resolve_stage3
+  require_inputs
+  init_state
+
+  if [[ "$RESET" -eq 1 ]]; then rm -f "$STATE"; init_state; fi
+  if [[ -n "$RESET_PHASE" ]]; then truncate_state_from_phase "$RESET_PHASE"; fi
+
+  start_watchdog
+
+  run_step time      step_time
+  run_step wipe      step_wipe
+  run_step partition step_partition
+  run_step mkfsraid  step_mkfsraid
+
+  ensure_target_mounted; step_done mount || mark_done mount
+  ensure_stage3_present; step_done stage3 || mark_done stage3
+  ensure_chrootprep;     step_done chroot || mark_done chroot
+
+  run_step install   step_install
+  run_step passwd    step_passwd
+
+  stop_watchdog
+  finish_msg
+}
+
+main "$@"
