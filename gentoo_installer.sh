@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # gentoo_installer.sh
 #
-# Gentoo UEFI + mdadm RAID root installer (systemd / hardened-systemd stage3).
+# Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
+# Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
+# unless STAGE3 / STAGE3_FLAVOR are overridden (see README.md).
 # Supports PROFILE_TARGET:
 #   server|desktop|gnome|plasma|xfce|hardened|hardened-gnome|hardened-plasma|hardened-xfce
 #
 # Key:
 # - FULL rerunnable phases via state file
+# - INIT_SYSTEM=systemd|openrc selects stage3, Portage profiles (.../systemd vs .../openrc), and service startup (systemctl vs rc-update)
+# - Stage3 tarball MD5 verified against mirror ${STAGE3}.DIGESTS when STAGE3_VERIFY_MD5=YES
 # - Fixes ERR-trap boolean-test crash by never running standalone [[ ... ]] in run_step()
 # - Fixes dracut tmpdir leak by env -i in chroot + TMPDIR=/var/tmp
 # - Forces initramfs output to /boot/initramfs-<kver>.img
@@ -16,28 +20,41 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Structure (top to bottom): configs -> logging -> core helpers -> watchdog ->
+#   preflight -> disk/RAID -> stage3/mount/chroot -> package lists ->
+#   chroot install phases -> step_install/passwd -> readiness -> main.
+
 # =============================================================================
 # TOP CONFIGS
 # =============================================================================
+# Disks / paths / RAID
 
 : "${ARMED:=YES}"
 : "${WIPE_DISKS:=YES}"
 : "${DISK_A:=/dev/sda}"
 : "${DISK_B:=/dev/sdb}"
+: "${INSTALL_DISKS:=}"               # space-separated; empty => legacy DISK_A + DISK_B (two disks)
+: "${ROOT_RAID10_LAYOUT:=n2}"       # mdadm --layout for raid10 (e.g. n2 o2 f2)
 : "${TARGET:=/mnt/gentoo}"
 : "${MD:=/dev/md0}"
-: "${ROOT_RAID_LEVEL:=raid0}"        # raid0|raid1
+: "${ROOT_RAID_LEVEL:=raid0}"        # raid0|raid1|raid4|raid5|raid6|raid10 (multi-disk); ignored for 1 disk
 : "${ROOT_FS:=ext4}"                 # ext4
 : "${EFI_SIZE_MIB:=512}"
 : "${SWAP_SIZE_GB:=16}"
 : "${RESUME:=YES}"
 
-: "${CONFIRM_ERASE:=ERASE-$(basename "$DISK_A")-$(basename "$DISK_B")}"
+: "${CONFIRM_ERASE:=}"               # set to output of confirm_erase_expected() after disks are resolved
+
+# Stage3 / init
 
 : "${STAGE3:=}"
 : "${STAGE3_FLAVOR_AUTO:=YES}"
-: "${STAGE3_FLAVOR:=systemd}"        # systemd|hardened-systemd
+: "${STAGE3_FLAVOR:=systemd}"        # systemd|openrc|hardened-systemd|hardened-openrc (auto overrides when STAGE3_FLAVOR_AUTO=YES)
 : "${STAGE3_AUTOBUILDS_BASE:=https://distfiles.gentoo.org/releases/amd64/autobuilds}"
+: "${INIT_SYSTEM:=systemd}"           # systemd|openrc — must match stage3 tarball / profile init
+: "${STAGE3_VERIFY_MD5:=YES}"       # YES: verify tarball MD5 from mirror ${URL}.DIGESTS before extract
+
+# Profile / GUI
 
 : "${PROFILE_TARGET:=hardened-plasma}"
 
@@ -73,6 +90,8 @@ IFS=$'\n\t'
 : "${GRUB_INSTALL_TO_DISK_B:=YES}"
 : "${GRUB_REMOVABLE:=NO}"
 
+# Chroot / logging tunables
+
 : "${CHROOT_DEBUG:=NO}"
 : "${CHROOT_TMPDIR:=/var/tmp}"
 
@@ -82,7 +101,7 @@ IFS=$'\n\t'
 : "${RO_CHECK_INTERVAL:=15}"
 
 # =============================================================================
-# Logging / errors / state
+# Logging, paths, and session state
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -154,6 +173,128 @@ phase(){ echo; echo "===== PHASE: $* ====="; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 disk_base(){ basename "$1"; }
+
+# Walk from any block device (partition, mapper, md, …) up to underlying TYPE=disk nodes.
+# Prints unique whole-disk paths (for comparisons). Handles md RAID via /sys/.../slaves when lsblk PKNAME is empty.
+backing_physical_disks(){
+  local top="$1"
+  [[ -e "$top" ]] || return 1
+  declare -A seen=()
+  local _walk
+  _walk(){
+    local src="$1"
+    src="$(readlink -f "$src")"
+    [[ -e "$src" ]] || return 0
+    [[ -z "${seen[$src]:-}" ]] || return 0
+    seen[$src]=1
+    local ty pk b sl
+    ty="$(lsblk -ndo TYPE "$src" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+    if [[ "$ty" == "disk" ]]; then
+      printf '%s\n' "$src"
+      return 0
+    fi
+    pk="$(lsblk -ndo PKNAME "$src" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+    if [[ -n "$pk" ]]; then
+      _walk "/dev/$pk"
+      return 0
+    fi
+    b="${src##*/}"
+    shopt -s nullglob
+    for sl in /sys/block/"$b"/slaves/*; do
+      [[ -e "$sl" ]] || continue
+      _walk "/dev/$(basename "$sl")"
+    done
+    shopt -u nullglob
+  }
+  _walk "$top"
+}
+
+# Whole-disk device -> partition path (sda1 vs nvme0n1p1).
+disk_part(){
+  local d="$1" num="$2"
+  if [[ "$d" == *nvme* || "$d" == *mmcblk* || "$d" == /dev/loop* ]]; then
+    printf '%s\n' "${d}p${num}"
+    return
+  fi
+  printf '%s\n' "${d}${num}"
+}
+
+# Resolved install targets (populated by install_disks_resolve).
+declare -a INSTALL_DISK_ARR=()
+INSTALL_ROOT_IS_RAID=0
+
+install_disks_resolve(){
+  INSTALL_DISK_ARR=()
+  local tok
+  if [[ -n "${INSTALL_DISKS// }" ]]; then
+    for tok in $INSTALL_DISKS; do
+      [[ -n "$tok" ]] || continue
+      INSTALL_DISK_ARR+=("$tok")
+    done
+  else
+    INSTALL_DISK_ARR=("$DISK_A" "$DISK_B")
+  fi
+  local i j n="${#INSTALL_DISK_ARR[@]}"
+  (( n >= 1 )) || die "No disks in INSTALL_DISKS / DISK_A"
+  for (( i = 0; i < n; i++ )); do
+    [[ -b "${INSTALL_DISK_ARR[i]}" ]] || die "Not a block device: ${INSTALL_DISK_ARR[i]}"
+  done
+  for (( i = 0; i < n; i++ )); do
+    for (( j = i + 1; j < n; j++ )); do
+      [[ "${INSTALL_DISK_ARR[i]}" != "${INSTALL_DISK_ARR[j]}" ]] || die "Duplicate disk in list: ${INSTALL_DISK_ARR[i]}"
+    done
+  done
+  if (( n >= 2 )); then
+    INSTALL_ROOT_IS_RAID=1
+  else
+    INSTALL_ROOT_IS_RAID=0
+  fi
+}
+
+confirm_erase_expected(){
+  local -a bases=()
+  local x sorted_line
+  for x in "${INSTALL_DISK_ARR[@]}"; do
+    bases+=("$(disk_base "$x")")
+  done
+  sorted_line="$(printf '%s\n' "${bases[@]}" | LC_ALL=C sort | paste -sd-)"
+  printf '%s\n' "ERASE-${sorted_line}"
+}
+
+validate_install_disk_policy(){
+  local n="${#INSTALL_DISK_ARR[@]}"
+  if (( n == 1 )); then
+    case "${ROOT_RAID_LEVEL:-}" in
+      raid0|raid1|raid4|raid5|raid6|raid10)
+        echo "NOTE: Single disk — ignoring ROOT_RAID_LEVEL=${ROOT_RAID_LEVEL} (root on partition, no md RAID)." >&2
+        ;;
+    esac
+    return 0
+  fi
+  case "${ROOT_RAID_LEVEL:-raid0}" in
+    raid0|raid1)
+      (( n >= 2 )) || die "raid0/raid1 requires at least 2 disks (have $n)"
+      ;;
+    raid4|raid5)
+      (( n >= 3 )) || die "raid4/raid5 requires at least 3 disks (have $n)"
+      ;;
+    raid6)
+      (( n >= 4 )) || die "raid6 requires at least 4 disks (have $n)"
+      ;;
+    raid10)
+      (( n >= 4 )) || die "raid10 requires at least 4 disks (have $n)"
+      (( n % 2 == 0 )) || die "raid10 with ROOT_RAID10_LAYOUT=${ROOT_RAID10_LAYOUT:-n2} expects an even disk count (have $n)"
+      ;;
+    *) die "ROOT_RAID_LEVEL must be raid0|raid1|raid4|raid5|raid6|raid10 (got ${ROOT_RAID_LEVEL:-})" ;;
+  esac
+}
+
+assert_valid_init_system(){
+  case "${INIT_SYSTEM:-systemd}" in
+    systemd|openrc) ;;
+    *) die "INIT_SYSTEM must be systemd or openrc (got ${INIT_SYSTEM:-})" ;;
+  esac
+}
 
 init_state(){ touch "$STATE" 2>/dev/null || true; chmod 600 "$STATE" 2>/dev/null || true; }
 
@@ -232,7 +373,7 @@ start_watchdog(){ phase "watchdog:start"; ro_watchdog & RO_WATCHDOG_PID=$!; echo
 stop_watchdog(){ phase "watchdog:stop"; kill "$RO_WATCHDOG_PID" 2>/dev/null || true; wait "$RO_WATCHDOG_PID" 2>/dev/null || true; }
 
 # =============================================================================
-# Preflight
+# Preflight (network, stage3 URL, validation banner, confirmations)
 # =============================================================================
 
 check_internet(){
@@ -248,11 +389,13 @@ resolve_stage3(){
 
   phase "preflight:stage3_resolve"
 
+  assert_valid_init_system
+
   if [[ "${STAGE3_FLAVOR_AUTO:-NO}" == "YES" ]]; then
     if [[ "${PROFILE_TARGET:-}" == hardened* ]]; then
-      STAGE3_FLAVOR="hardened-systemd"
+      STAGE3_FLAVOR="hardened-${INIT_SYSTEM}"
     else
-      STAGE3_FLAVOR="systemd"
+      STAGE3_FLAVOR="${INIT_SYSTEM}"
     fi
   fi
 
@@ -265,32 +408,81 @@ resolve_stage3(){
   [[ -n "$rel" ]] || die "Could not parse stage3 path from $idx_url"
   STAGE3="${STAGE3_AUTOBUILDS_BASE}/${rel}"
 
+  echo "INIT_SYSTEM   : ${INIT_SYSTEM}"
   echo "Stage3 flavor : $STAGE3_FLAVOR"
   echo "Latest stage3 : $STAGE3"
   echo "Log  : $LOG"
   echo "State: $STATE"
-  echo "Disks: $DISK_A $DISK_B  RAID: $MD  Target: $TARGET  RAID_LEVEL: $ROOT_RAID_LEVEL"
+  echo "Install disks : ${INSTALL_DISK_ARR[*]:-${DISK_A} ${DISK_B}}"
+  echo "RAID root      : ${INSTALL_ROOT_IS_RAID:-?}  MD: $MD  Target: $TARGET  ROOT_RAID_LEVEL: $ROOT_RAID_LEVEL"
   echo "PROFILE_TARGET: $PROFILE_TARGET"
   echo "GUI_ENABLE: $GUI_ENABLE  GUI_FLAVOR: $GUI_FLAVOR"
   echo "RESUME: $RESUME"
 }
 
-refuse_dangerous_disks(){
-  local root_src root_pk
-  root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-  [[ -n "$root_src" ]] || die "Cannot determine current root device"
-  root_pk="$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)"
-  if [[ -n "$root_pk" ]]; then
-    [[ "/dev/$root_pk" != "$DISK_A" ]] || die "Refusing: DISK_A appears to back current /"
-    [[ "/dev/$root_pk" != "$DISK_B" ]] || die "Refusing: DISK_B appears to back current /"
+validate_init_stage3_consistency(){
+  assert_valid_init_system
+  local base
+  base="$(basename "${STAGE3:-}")"
+  if [[ "$base" == *"-openrc-"* ]] || [[ "$base" == *"-hardened-openrc-"* ]]; then
+    [[ "$INIT_SYSTEM" == openrc ]] || die "Stage3 tarball is OpenRC ($base) but INIT_SYSTEM=$INIT_SYSTEM"
+  elif [[ "$base" == *"-systemd-"* ]] || [[ "$base" == *"-hardened-systemd-"* ]]; then
+    [[ "$INIT_SYSTEM" == systemd ]] || die "Stage3 tarball is systemd ($base) but INIT_SYSTEM=$INIT_SYSTEM"
+  fi
+  if [[ "${STAGE3_FLAVOR_AUTO:-YES}" != YES ]]; then
+    if [[ "${STAGE3_FLAVOR:-}" == *openrc* ]] && [[ "$INIT_SYSTEM" != openrc ]]; then
+      die "STAGE3_FLAVOR=${STAGE3_FLAVOR:-} implies OpenRC but INIT_SYSTEM=$INIT_SYSTEM"
+    fi
+    if [[ "${STAGE3_FLAVOR:-}" == *systemd* ]] && [[ "$INIT_SYSTEM" != systemd ]]; then
+      die "STAGE3_FLAVOR=${STAGE3_FLAVOR:-} implies systemd but INIT_SYSTEM=$INIT_SYSTEM"
+    fi
   fi
 }
 
+announce_install_profile(){
+  echo ""
+  echo "======== INSTALL PROFILE (verify before proceeding) ========"
+  echo "INIT_SYSTEM     : ${INIT_SYSTEM:-systemd}   # drives stage3, profiles, systemctl vs rc-update"
+  echo "PROFILE_TARGET  : ${PROFILE_TARGET:-}"
+  echo "STAGE3_FLAVOR   : ${STAGE3_FLAVOR:-}"
+  echo "STAGE3 URL      : ${STAGE3:-}"
+  echo "INSTALL_DISKS   : ${INSTALL_DISKS:-}" "(resolved: ${INSTALL_DISK_ARR[*]:-unset})"
+  echo "==========================================================="
+  echo ""
+}
+
+refuse_dangerous_disks(){
+  local root_src d idl rdl
+  root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+  [[ -n "$root_src" ]] || die "Cannot determine current root device"
+
+  declare -A root_disks=()
+  while IFS= read -r rdl; do
+    [[ -n "$rdl" ]] || continue
+    root_disks["$rdl"]=1
+  done < <(backing_physical_disks "$root_src" 2>/dev/null | sort -u)
+
+  if ((${#root_disks[@]} == 0)); then
+    echo "NOTE: Root filesystem source '$root_src' is not mapped to block disks (e.g. tmpfs/NFS/live overlay); skipping root-vs-install-disk overlap check." >&2
+    return 0
+  fi
+
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    while IFS= read -r idl; do
+      [[ -n "$idl" ]] || continue
+      [[ -z "${root_disks[$idl]:-}" ]] || die "Refusing: install disk $d (physical $idl) backs or overlaps current /"
+    done < <(backing_physical_disks "$d" | sort -u)
+  done
+}
+
 confirm_destroy(){
+  local d
   echo
+  echo "Installed system init: ${INIT_SYSTEM:-systemd} (stage3 + Portage profile + service commands match this)"
   echo "THIS WILL DESTROY ALL DATA ON:"
-  echo "  $DISK_A  ($(lsblk -dn -o MODEL,SERIAL,SIZE "$DISK_A" 2>/dev/null || true))"
-  echo "  $DISK_B  ($(lsblk -dn -o MODEL,SERIAL,SIZE "$DISK_B" 2>/dev/null || true))"
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    echo "  $d  ($(lsblk -dn -o MODEL,SERIAL,SIZE "$d" 2>/dev/null || true))"
+  done
   echo
   echo "Type: I_UNDERSTAND"
   read -r ans
@@ -300,16 +492,16 @@ confirm_destroy(){
 require_inputs(){
   [[ "${ARMED:-NO}" == "YES" ]] || die "Set ARMED=YES"
   [[ "${WIPE_DISKS:-NO}" == "YES" ]] || die "Set WIPE_DISKS=YES"
-  [[ -b "$DISK_A" ]] || die "Disk not found: $DISK_A"
-  [[ -b "$DISK_B" ]] || die "Disk not found: $DISK_B"
-  [[ "$DISK_A" != "$DISK_B" ]] || die "DISK_A and DISK_B must differ"
   [[ -n "${STAGE3:-}" ]] || die "STAGE3 is empty"
-  local expect="ERASE-$(disk_base "$DISK_A")-$(disk_base "$DISK_B")"
+  validate_init_stage3_consistency
+  validate_install_disk_policy
+  local expect
+  expect="$(confirm_erase_expected)"
   [[ "${CONFIRM_ERASE:-}" == "$expect" ]] || die "Set CONFIRM_ERASE=$expect"
 }
 
 # =============================================================================
-# Disk / RAID
+# Disk layout, RAID, root filesystem
 # =============================================================================
 
 preflight_cleanup(){
@@ -331,7 +523,8 @@ step_wipe(){
   refuse_dangerous_disks
   confirm_destroy
   preflight_cleanup
-  for d in "$DISK_A" "$DISK_B"; do
+  local d
+  for d in "${INSTALL_DISK_ARR[@]}"; do
     sgdisk --zap-all "$d" || true
     sgdisk -o "$d" || true
     wipefs -a "$d" || true
@@ -343,30 +536,47 @@ step_wipe(){
 step_partition(){
   phase "partition"
   local efi_end="+${EFI_SIZE_MIB}MiB"
-  for d in "$DISK_A" "$DISK_B"; do
+  local n="${#INSTALL_DISK_ARR[@]}"
+  local d
+  if (( n == 1 )); then
+    d="${INSTALL_DISK_ARR[0]}"
     sgdisk -Z "$d" || true
     sgdisk -o "$d"
     sgdisk -n "1:0:${efi_end}" -t "1:EF00" -c "1:EFI" "$d"
-    sgdisk -n "2:0:0"          -t "2:FD00" -c "2:RAIDROOT" "$d"
-  done
-  partprobe "$DISK_A" "$DISK_B" 2>/dev/null || true
+    sgdisk -n "2:0:0" -t "2:8300" -c "2:ROOT" "$d"
+    partprobe "$d" 2>/dev/null || true
+  else
+    for d in "${INSTALL_DISK_ARR[@]}"; do
+      sgdisk -Z "$d" || true
+      sgdisk -o "$d"
+      sgdisk -n "1:0:${efi_end}" -t "1:EF00" -c "1:EFI" "$d"
+      sgdisk -n "2:0:0" -t "2:FD00" -c "2:RAIDROOT" "$d"
+    done
+    partprobe "${INSTALL_DISK_ARR[@]}" 2>/dev/null || true
+  fi
   udevadm settle || true
 }
 
 min_member_kib(){
-  local a b minb
-  a="$(blockdev --getsize64 "${DISK_A}2")"
-  b="$(blockdev --getsize64 "${DISK_B}2")"
-  [[ -n "$a" && -n "$b" ]] || die "blockdev size failed"
-  minb="$a"; (( b < minb )) && minb="$b"
+  local minb="" sz d p2
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    p2="$(disk_part "$d" 2)"
+    sz="$(blockdev --getsize64 "$p2")"
+    [[ -n "$sz" ]] || die "blockdev size failed for $p2"
+    if [[ -z "$minb" ]] || (( sz < minb )); then minb="$sz"; fi
+  done
   echo $(( minb / 1024 ))
 }
 
 wipe_member_signatures(){
   mdadm --stop "$MD" 2>/dev/null || true
   mdadm --remove "$MD" 2>/dev/null || true
-  mdadm --zero-superblock --force "${DISK_A}2" "${DISK_B}2" 2>/dev/null || true
-  wipefs -a "${DISK_A}2" "${DISK_B}2" 2>/dev/null || true
+  local d p2
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    p2="$(disk_part "$d" 2)"
+    mdadm --zero-superblock --force "$p2" 2>/dev/null || true
+    wipefs -a "$p2" 2>/dev/null || true
+  done
   udevadm settle 2>/dev/null || true
 }
 
@@ -374,22 +584,26 @@ mdadm_supports(){ mdadm --help 2>/dev/null | grep -qE "$1"; }
 
 mdadm_create_attempt(){
   local level="$1" raid_devs="$2" bitmap_arg="$3" size_kib="$4"
+  shift 4
+  local -a members=("$@")
+  local -a mdargs=( --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" )
+  [[ "$level" == 10 ]] && mdargs+=( --layout="${ROOT_RAID10_LAYOUT:-n2}" )
+  mdargs+=( --size="$size_kib" )
+  [[ -n "$bitmap_arg" ]] && mdargs+=( "$bitmap_arg" )
+  mdargs+=( --force )
 
   if mdadm_supports '(^|[[:space:]])--yes($|[[:space:]])'; then
-    mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
-      --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force --yes "${DISK_A}2" "${DISK_B}2"
+    mdadm "${mdargs[@]}" --yes "${members[@]}"
     return $?
   fi
   if mdadm_supports '(^|[[:space:]])-y($|[[:space:]])'; then
-    mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
-      --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force -y "${DISK_A}2" "${DISK_B}2"
+    mdadm "${mdargs[@]}" -y "${members[@]}"
     return $?
   fi
 
   local rc
   set +o pipefail
-  yes | mdadm --create "$MD" --metadata=1.2 --level="$level" --raid-devices="$raid_devs" \
-    --size="$size_kib" ${bitmap_arg:+$bitmap_arg} --force "${DISK_A}2" "${DISK_B}2"
+  yes | mdadm "${mdargs[@]}" "${members[@]}"
   rc=$?
   set -o pipefail
 
@@ -401,6 +615,11 @@ mdadm_create_attempt(){
 
 mdadm_create_with_retry(){
   local level="$1" raid_devs="$2" bitmap_arg="$3"
+  local -a members=()
+  local d
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    members+=("$(disk_part "$d" 2)")
+  done
   local base_kib; base_kib="$(min_member_kib)"
   local margins=(0 262144 524288 1048576 2097152 4194304 8388608)
 
@@ -408,7 +627,7 @@ mdadm_create_with_retry(){
     local size_kib=$(( base_kib - m ))
     [[ "$size_kib" -gt 1024 ]] || continue
     wipe_member_signatures
-    if mdadm_create_attempt "$level" "$raid_devs" "$bitmap_arg" "$size_kib"; then
+    if mdadm_create_attempt "$level" "$raid_devs" "$bitmap_arg" "$size_kib" "${members[@]}"; then
       mdadm --detail "$MD" >/dev/null 2>&1 || die "mdadm created but cannot detail $MD"
       echo "mdadm: create succeeded with size_kib=$size_kib"
       return 0
@@ -423,14 +642,37 @@ step_mkfsraid(){
   phase "mkfsraid"
   preflight_cleanup
 
-  mkfs.vfat -F32 "${DISK_A}1"
-  mkfs.vfat -F32 "${DISK_B}1"
+  local n="${#INSTALL_DISK_ARR[@]}"
+  local d
+
+  if (( n == 1 )); then
+    local p1 p2
+    d="${INSTALL_DISK_ARR[0]}"
+    p1="$(disk_part "$d" 1)"
+    p2="$(disk_part "$d" 2)"
+    mkfs.vfat -F32 "$p1"
+    case "$ROOT_FS" in
+      ext4) mkfs.ext4 -F "$p2" ;;
+      *) die "ROOT_FS unsupported: $ROOT_FS" ;;
+    esac
+    export ROOT_BLK="$p2"
+    return 0
+  fi
+
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    mkfs.vfat -F32 "$(disk_part "$d" 1)"
+  done
 
   local level raid_devs bitmap_arg=""
-  case "$ROOT_RAID_LEVEL" in
-    raid0) level=0; raid_devs=2 ;;
-    raid1) level=1; raid_devs=2; bitmap_arg="--bitmap=internal" ;;
-    *) die "ROOT_RAID_LEVEL must be raid0 or raid1" ;;
+  raid_devs="$n"
+  case "${ROOT_RAID_LEVEL:-raid0}" in
+    raid0)  level=0 ;;
+    raid1)  level=1; bitmap_arg="--bitmap=internal" ;;
+    raid4)  level=4 ;;
+    raid5)  level=5 ;;
+    raid6)  level=6 ;;
+    raid10) level=10 ;;
+    *) die "ROOT_RAID_LEVEL must be raid0|raid1|raid4|raid5|raid6|raid10" ;;
   esac
 
   mdadm_create_with_retry "$level" "$raid_devs" "$bitmap_arg"
@@ -439,10 +681,11 @@ step_mkfsraid(){
     ext4) mkfs.ext4 -F "$MD" ;;
     *) die "ROOT_FS unsupported: $ROOT_FS" ;;
   esac
+  export ROOT_BLK=""
 }
 
 # =============================================================================
-# Mount / stage3 / chroot
+# Stage3 tarball / mounts / chroot environment
 # =============================================================================
 
 ensure_md_present(){
@@ -451,32 +694,85 @@ ensure_md_present(){
   [[ -b "$MD" ]] || die "RAID device missing: $MD"
 }
 
-ensure_target_mounted(){
-  phase "ensure:mount"
+ensure_root_volume_present(){
+  if [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 0 ]]; then
+    local rp
+    rp="$(disk_part "${INSTALL_DISK_ARR[0]}" 2)"
+    [[ -b "$rp" ]] || die "Root partition missing: $rp"
+    return 0
+  fi
   ensure_md_present
-
-  mkdir -p "$TARGET"
-  mountpoint -q "$TARGET" || mount "$MD" "$TARGET"
-
-  mkdir -p "$TARGET/boot/efi" "$TARGET/boot/efi2" "$TARGET/efi" "$TARGET/efi2"
-  mountpoint -q "$TARGET/boot/efi"  || mount "${DISK_A}1" "$TARGET/boot/efi"
-  mountpoint -q "$TARGET/boot/efi2" || mount "${DISK_B}1" "$TARGET/boot/efi2" || true
-
-  mountpoint -q "$TARGET/efi"  || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
-  mountpoint -q "$TARGET/efi2" || mount --bind "$TARGET/boot/efi2" "$TARGET/efi2" || true
 }
 
 stage3_cache_path(){ echo "${STAGE3_CACHE_DIR}/$(basename "$STAGE3")"; }
 
+verify_stage3_tarball_md5(){
+  local dst="${1:?}"
+  [[ "${STAGE3_VERIFY_MD5:-YES}" == YES ]] || return 0
+  need_cmd md5sum
+  local dig_url="${STAGE3}.DIGESTS"
+  local dig_tmp base expected actual
+  base="$(basename "$STAGE3")"
+  dig_tmp="$(mktemp -p "$STAGE3_CACHE_DIR" ".digests.XXXXXX")"
+  wget -qO "$dig_tmp" "$dig_url" || die "Failed fetching DIGESTS: $dig_url"
+  expected="$(awk -v fn="$base" '
+    /^# MD5/ { want=1; next }
+    /^#/ { want=0 }
+    want && NF>=2 {
+      f=$2
+      sub(/^\*/, "", f)
+      if (f == fn) { print $1; exit }
+    }
+  ' "$dig_tmp")"
+  rm -f "$dig_tmp"
+  [[ -n "$expected" ]] || die "No MD5 checksum for $base in $dig_url"
+  actual="$(md5sum "$dst" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || die "MD5 mismatch for $base (expected $expected got $actual)"
+  echo "MD5 verified: $base"
+}
+
 fetch_stage3_if_needed(){
   mkdir -p "$STAGE3_CACHE_DIR" 2>/dev/null || true
   local dst; dst="$(stage3_cache_path)"
-  if [[ -s "$dst" ]]; then
-    return 0
+  if [[ ! -s "$dst" ]]; then
+    phase "ensure:stage3_fetch"
+    echo "Downloading Stage3 -> $dst"
+    wget -O "$dst" "$STAGE3" || die "Stage3 download failed"
   fi
-  phase "ensure:stage3_fetch"
-  echo "Downloading Stage3 -> $dst"
-  wget -O "$dst" "$STAGE3" || die "Stage3 download failed"
+  verify_stage3_tarball_md5 "$dst"
+}
+
+ensure_target_mounted(){
+  phase "ensure:mount"
+  local n="${#INSTALL_DISK_ARR[@]}"
+  local i d
+
+  ensure_root_volume_present
+
+  mkdir -p "$TARGET"
+  if [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 0 ]]; then
+    mountpoint -q "$TARGET" || mount "$(disk_part "${INSTALL_DISK_ARR[0]}" 2)" "$TARGET"
+  else
+    mountpoint -q "$TARGET" || mount "$MD" "$TARGET"
+  fi
+
+  mkdir -p "$TARGET/boot/efi" "$TARGET/efi"
+  mountpoint -q "$TARGET/boot/efi" || mount "$(disk_part "${INSTALL_DISK_ARR[0]}" 1)" "$TARGET/boot/efi"
+  mountpoint -q "$TARGET/efi" || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
+
+  if (( n >= 2 )); then
+    for (( i = 1; i < n; i++ )); do
+      d="${INSTALL_DISK_ARR[i]}"
+      local ep num
+      num=$((i + 1))
+      ep="$(disk_part "$d" 1)"
+      mkdir -p "$TARGET/boot/efi${num}" "$TARGET/efi${num}"
+      mountpoint -q "$TARGET/boot/efi${num}" || mount "$ep" "$TARGET/boot/efi${num}" \
+        || die "Failed to mount ESP $ep on $TARGET/boot/efi${num} (required for multi-disk UEFI)"
+      mountpoint -q "$TARGET/efi${num}" || mount --bind "$TARGET/boot/efi${num}" "$TARGET/efi${num}" \
+        || die "Failed bind-mount $TARGET/efi${num}"
+    done
+  fi
 }
 
 ensure_stage3_present(){
@@ -495,7 +791,14 @@ ensure_chrootprep(){
   ensure_target_mounted
 
   mkdir -p "$TARGET/tmp" "$TARGET/var/tmp"
-  mkdir -p "$TARGET"/{proc,sys,dev,run,etc,root,home,usr,boot,boot/grub,boot/efi,boot/efi2,efi,efi2,var/db/repos,etc/portage/repos.conf,etc/portage/package.use,etc/portage/package.accept_keywords,etc/portage/package.unmask,etc/portage/package.env,etc/portage/env,etc/dracut.conf.d,etc/kernel,etc/kernel/install.d} || true
+  mkdir -p "$TARGET"/{proc,sys,dev,run,etc,root,home,usr,boot,boot/grub,boot/efi,efi,var/db/repos,etc/portage/repos.conf,etc/portage/package.use,etc/portage/package.accept_keywords,etc/portage/package.unmask,etc/portage/package.env,etc/portage/env,etc/dracut.conf.d,etc/kernel,etc/kernel/install.d} || true
+  local nd="${#INSTALL_DISK_ARR[@]}"
+  local i
+  if (( nd >= 2 )); then
+    for (( i = 2; i <= nd; i++ )); do
+      mkdir -p "$TARGET/boot/efi$i" "$TARGET/efi$i" || true
+    done
+  fi
   cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf" 2>/dev/null || true
 
   mountpoint -q "$TARGET/proc" || mount -t proc /proc "$TARGET/proc"
@@ -503,15 +806,18 @@ ensure_chrootprep(){
   mountpoint -q "$TARGET/dev"  || { mount --rbind /dev "$TARGET/dev"; mount --make-rslave "$TARGET/dev"; }
   mountpoint -q "$TARGET/run"  || { mount --rbind /run "$TARGET/run" 2>/dev/null || true; mount --make-rslave "$TARGET/run" 2>/dev/null || true; }
 
-  mountpoint -q "$TARGET/efi"  || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
-  mountpoint -q "$TARGET/efi2" || mount --bind "$TARGET/boot/efi2" "$TARGET/efi2" || true
+  mountpoint -q "$TARGET/efi" || mount --bind "$TARGET/boot/efi" "$TARGET/efi"
+  if (( nd >= 2 )); then
+    for (( i = 2; i <= nd; i++ )); do
+      mountpoint -q "$TARGET/efi$i" || mount --bind "$TARGET/boot/efi$i" "$TARGET/efi$i" || true
+    done
+  fi
 }
 
-chroot_cmd(){
-  local cmd="$1"
-  ensure_chrootprep
-
-  local -a base_env=(
+# Populates name-referenced array with env vars for `env -i` inside the chroot.
+chroot_fill_base_env(){
+  local -n __chroot_env="${1:?}"
+  __chroot_env=(
     "HOME=/root"
     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     "TERM=${TERM:-linux}"
@@ -521,6 +827,14 @@ chroot_cmd(){
     "TEMP=${CHROOT_TMPDIR}"
     "CHROOT_DEBUG=${CHROOT_DEBUG}"
   )
+}
+
+chroot_cmd(){
+  local cmd="$1"
+  ensure_chrootprep
+
+  local -a base_env
+  chroot_fill_base_env base_env
 
   echo "CHROOT> $cmd"
   chroot "$TARGET" /usr/bin/env -i "${base_env[@]}" /bin/bash -lc "$cmd"
@@ -532,16 +846,8 @@ chroot_script(){
 
   ensure_chrootprep
 
-  local -a base_env=(
-    "HOME=/root"
-    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    "TERM=${TERM:-linux}"
-    "LANG=${LANG:-C.UTF-8}"
-    "TMPDIR=${CHROOT_TMPDIR}"
-    "TMP=${CHROOT_TMPDIR}"
-    "TEMP=${CHROOT_TMPDIR}"
-    "CHROOT_DEBUG=${CHROOT_DEBUG}"
-  )
+  local -a base_env
+  chroot_fill_base_env base_env
 
   local name="/root/.installer.$(date +%s).$$.$RANDOM.sh"
   local host_path="$TARGET$name"
@@ -556,7 +862,7 @@ chroot_script(){
 }
 
 # =============================================================================
-# Packages
+# Package lists (consumed by chroot_emerge_all)
 # =============================================================================
 
 PKGS_CORE=(
@@ -592,7 +898,7 @@ PKGS_NET_GUI=( net-misc/networkmanager )
 join_space(){ local IFS=' '; echo "$*"; }
 
 # =============================================================================
-# Chroot install phases
+# Chroot: Portage, kernel, services, bootloader (order matches step_install)
 # =============================================================================
 
 chroot_automerge_portage_cfgs(){
@@ -615,9 +921,11 @@ EOF
 
 chroot_bootstrap_portage(){
   phase "install:portage_bootstrap"
-  chroot_script "PROFILE_TARGET=$PROFILE_TARGET" <<'EOF'
+  chroot_script "PROFILE_TARGET=$PROFILE_TARGET" "INIT_SYSTEM=${INIT_SYSTEM:-systemd}" <<'EOF'
 set -euo pipefail
 [ "${CHROOT_DEBUG:-NO}" = "YES" ] && set -x
+
+prof_init="${INIT_SYSTEM:?INIT_SYSTEM unset in portage bootstrap}"
 
 mkdir -p /etc/portage/repos.conf /var/db/repos
 
@@ -679,26 +987,26 @@ id=""
 path=""
 
 case "$target" in
-  server)          read -r id path < <(pick_id_path 'default/linux/amd64/.*/systemd') ;;
-  hardened)        read -r id path < <(pick_id_path 'default/linux/amd64/.*/hardened/systemd') ;;
-  desktop)         read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/systemd') ;;
-  gnome)           read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/gnome/systemd') ;;
-  plasma)          read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/plasma/systemd') ;;
-  xfce)            read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/xfce/systemd') ;;
+  server)          read -r id path < <(pick_id_path "default/linux/amd64/.*/${prof_init}") ;;
+  hardened)        read -r id path < <(pick_id_path "default/linux/amd64/.*/hardened/${prof_init}") ;;
+  desktop)         read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/${prof_init}") ;;
+  gnome)           read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/gnome/${prof_init}") ;;
+  plasma)          read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/plasma/${prof_init}") ;;
+  xfce)            read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/xfce/${prof_init}") ;;
   hardened-gnome)
-                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/gnome/systemd')
+                   read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/gnome/${prof_init}")
                    set_profile_by_id "$id"
                    make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-gnome"
                    id=""
                    ;;
   hardened-plasma)
-                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/plasma/systemd')
+                   read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/plasma/${prof_init}")
                    set_profile_by_id "$id"
                    make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-plasma"
                    id=""
                    ;;
   hardened-xfce)
-                   read -r id path < <(pick_id_path 'default/linux/amd64/.*/desktop/xfce/systemd')
+                   read -r id path < <(pick_id_path "default/linux/amd64/.*/desktop/xfce/${prof_init}")
                    set_profile_by_id "$id"
                    make_stacked_profile "$path" "$(pick_hardened_feature_path)" "hardened-xfce"
                    id=""
@@ -808,17 +1116,27 @@ EOF
 
 chroot_write_kernel_install_conf(){
   phase "install:kernel_install_conf"
-  chroot_script "MD_DEV=$MD" "ROOT_FS=$ROOT_FS" "KERNEL_CMDLINE_OVERRIDE=$KERNEL_CMDLINE_OVERRIDE" <<'EOF'
+  local root_vol="$MD"
+  [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 0 ]] && root_vol="$(disk_part "${INSTALL_DISK_ARR[0]}" 2)"
+  chroot_script \
+    "ROOT_VOL_DEV=$root_vol" \
+    "ROOT_FS=$ROOT_FS" \
+    "KERNEL_CMDLINE_OVERRIDE=$KERNEL_CMDLINE_OVERRIDE" \
+    "INIT_SYSTEM=${INIT_SYSTEM:-systemd}" \
+    "INSTALL_ROOT_IS_RAID=${INSTALL_ROOT_IS_RAID:-0}" \
+    <<'EOF'
 set -euo pipefail
 mkdir -p /etc/cmdline.d /etc/kernel /etc/kernel/install.d /etc/dracut.conf.d /boot
 
-root_uuid="$(blkid -s UUID -o value "${MD_DEV}")"
-[ -n "$root_uuid" ] || { echo "ERROR: cannot read UUID for ${MD_DEV}"; exit 1; }
+root_uuid="$(blkid -s UUID -o value "${ROOT_VOL_DEV}")"
+[ -n "$root_uuid" ] || { echo "ERROR: cannot read UUID for ${ROOT_VOL_DEV}"; exit 1; }
 
 if [ -n "${KERNEL_CMDLINE_OVERRIDE:-}" ]; then
   cmd="${KERNEL_CMDLINE_OVERRIDE}"
-else
+elif [ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]; then
   cmd="root=UUID=${root_uuid} rootfstype=${ROOT_FS} rw rd.auto=1"
+else
+  cmd="root=UUID=${root_uuid} rootfstype=${ROOT_FS} rw"
 fi
 
 printf '%s\n' "$cmd" > /etc/cmdline
@@ -836,9 +1154,12 @@ cat > /etc/dracut.conf.d/10-installer-cmdline.conf <<EOC
 kernel_cmdline="${cmd}"
 EOC
 
-cat > /etc/dracut.conf.d/99-installer.conf <<'EOC'
+rm -f /etc/dracut.conf.d/99-installer-mdraid.conf 2>/dev/null || true
+if [ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]; then
+  cat > /etc/dracut.conf.d/99-installer-mdraid.conf <<'EOC'
 add_dracutmodules+=" mdraid "
 EOC
+fi
 
 cat > /etc/kernel/install.d/05-check-chroot.install <<'EOC'
 #!/bin/sh
@@ -846,7 +1167,7 @@ exit 0
 EOC
 chmod 0755 /etc/kernel/install.d/05-check-chroot.install
 
-if [ ! -s /etc/machine-id ]; then
+if [ "${INIT_SYSTEM:-systemd}" = "systemd" ] && [ ! -s /etc/machine-id ]; then
   systemd-machine-id-setup >/dev/null 2>&1 || true
 fi
 EOF
@@ -951,13 +1272,27 @@ fi
 EOF
 }
 
-chroot_write_mdadm_fstab(){
-  phase "install:mdadm_fstab"
-  chroot_script "DISK_A=$DISK_A" "MD_DEV=$MD" "ROOT_FS=$ROOT_FS" <<'EOF'
+chroot_write_fstab(){
+  phase "install:fstab"
+  local primary="${INSTALL_DISK_ARR[0]}"
+  local efi_dev root_vol
+  efi_dev="$(disk_part "$primary" 1)"
+  root_vol="$MD"
+  [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 0 ]] && root_vol="$(disk_part "$primary" 2)"
+  chroot_script \
+    "EFI_PART_DEV=$efi_dev" \
+    "ROOT_VOL_DEV=$root_vol" \
+    "ROOT_FS=$ROOT_FS" \
+    "INSTALL_ROOT_IS_RAID=${INSTALL_ROOT_IS_RAID:-0}" \
+    <<'EOF'
 set -euo pipefail
-mdadm --detail --scan > /etc/mdadm.conf || true
-efi_uuid="$(blkid -s UUID -o value "${DISK_A}1")"
-root_uuid="$(blkid -s UUID -o value "${MD_DEV}")"
+efi_uuid="$(blkid -s UUID -o value "${EFI_PART_DEV}")"
+root_uuid="$(blkid -s UUID -o value "${ROOT_VOL_DEV}")"
+if [ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]; then
+  mdadm --detail --scan > /etc/mdadm.conf || true
+else
+  : > /etc/mdadm.conf || true
+fi
 cat > /etc/fstab <<EOC
 UUID=${root_uuid}  /          ${ROOT_FS}  noatime,errors=remount-ro  0 1
 UUID=${efi_uuid}   /boot/efi   vfat       umask=0077               0 2
@@ -968,41 +1303,75 @@ EOF
 
 chroot_dracut_initramfs(){
   phase "install:initramfs"
-  chroot_script <<'EOF'
+  chroot_script "INSTALL_ROOT_IS_RAID=${INSTALL_ROOT_IS_RAID:-0}" <<'EOF'
 set -euo pipefail
 mkdir -p /boot /etc/dracut.conf.d
 kver="$(ls -1 /lib/modules 2>/dev/null | sort -V | tail -n1)"
 [ -n "$kver" ] || { echo "ERROR: /lib/modules missing or empty"; exit 2; }
 out="/boot/initramfs-${kver}.img"
-dracut --force "$out" "$kver" --add mdraid
+if [ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]; then
+  dracut --force "$out" "$kver" --add mdraid
+else
+  dracut --force "$out" "$kver"
+fi
 ls -l "$out"
 EOF
 }
 
 chroot_enable_services(){
-  phase "install:services"
+  phase "install:services (INIT_SYSTEM=${INIT_SYSTEM:-systemd})"
   chroot_script \
     "GUI_ENABLE=$GUI_ENABLE" \
     "GUI_FLAVOR=$GUI_FLAVOR" \
     "GUI_ENABLE_NETWORKMANAGER=$GUI_ENABLE_NETWORKMANAGER" \
     "INSTALL_SERVER_STACK=$INSTALL_SERVER_STACK" \
+    "INIT_SYSTEM=${INIT_SYSTEM:-systemd}" \
     <<'EOF'
 set -euo pipefail
-systemctl enable sshd || true
+# Single dispatcher: every boot service goes through svc_enable so systemd vs OpenRC stays consistent.
+init="${INIT_SYSTEM:-systemd}"
+case "$init" in systemd|openrc) ;; *) echo "ERROR: INIT_SYSTEM must be systemd or openrc (got $init)" >&2; exit 1 ;; esac
+
+svc_enable(){
+  local name="$1"
+  case "$init" in
+    systemd) systemctl enable "$name" || true ;;
+    openrc)  rc-update add "$name" default || true ;;
+  esac
+}
+
+svc_enable_php_fpm_if_present(){
+  case "$init" in
+    systemd)
+      if systemctl list-unit-files 2>/dev/null | grep -q '^php-fpm\.service'; then
+        svc_enable php-fpm
+      fi
+      ;;
+    openrc)
+      if [ -x /etc/init.d/php-fpm ]; then
+        svc_enable php-fpm
+      fi
+      ;;
+  esac
+}
+
+svc_enable sshd
 
 if [ "${INSTALL_SERVER_STACK:-NO}" = "YES" ]; then
-  systemctl enable apache2 mariadb vsftpd || true
-  if systemctl list-unit-files | grep -q '^php-fpm\.service'; then
-    systemctl enable php-fpm || true
-  fi
+  svc_enable apache2
+  svc_enable mariadb
+  svc_enable vsftpd
+  svc_enable_php_fpm_if_present
 fi
 
 if [ "${GUI_ENABLE:-NO}" = "YES" ]; then
-  [ "${GUI_ENABLE_NETWORKMANAGER:-NO}" = "YES" ] && systemctl enable NetworkManager || true
+  if [ "${GUI_ENABLE_NETWORKMANAGER:-NO}" = "YES" ]; then
+    svc_enable NetworkManager
+  fi
   case "${GUI_FLAVOR:-}" in
-    plasma) systemctl enable sddm || true ;;
-    gnome)  systemctl enable gdm || true ;;
-    xfce)   systemctl enable lightdm || true ;;
+    plasma) svc_enable sddm ;;
+    gnome)  svc_enable gdm ;;
+    xfce)   svc_enable lightdm ;;
   esac
 fi
 EOF
@@ -1020,16 +1389,24 @@ grub-mkconfig -o /boot/grub/grub.cfg
 EOF
 }
 
-mirror_esp_to_disk_b(){
+mirror_esp_to_additional_disks(){
   [[ "$GRUB_INSTALL_TO_DISK_B" == "YES" ]] || return 0
-  phase "install:grub_disk_b+mirror"
-  chroot_script "GRUB_REMOVABLE=$GRUB_REMOVABLE" <<'EOF'
+  local n="${#INSTALL_DISK_ARR[@]}"
+  (( n >= 2 )) || return 0
+  phase "install:grub_mirror_extra_esps"
+  local i efi_num
+  for (( i = 1; i < n; i++ )); do
+    efi_num=$((i + 1))
+    chroot_script "GRUB_REMOVABLE=$GRUB_REMOVABLE" "EFI_NUM=$efi_num" <<'EOF'
 set -euo pipefail
 rem=""
 [ "${GRUB_REMOVABLE:-NO}" = "YES" ] && rem="--removable"
-grub-install --target=x86_64-efi --efi-directory=/boot/efi2 --bootloader-id=Gentoo --recheck $rem || true
-rsync -aHAX --delete /boot/efi/ /boot/efi2/ || true
+efidir="/boot/efi${EFI_NUM}"
+[[ -d "$efidir" ]] || { echo "ERROR: $efidir missing (extra ESP not mounted?)"; exit 1; }
+grub-install --target=x86_64-efi --efi-directory="$efidir" --bootloader-id=Gentoo --recheck $rem
+rsync -aHAX --delete /boot/efi/ "$efidir/"
 EOF
+  done
 }
 
 chroot_create_first_user(){
@@ -1073,8 +1450,12 @@ chmod 0440 /etc/sudoers.d/00-wheel
 EOF
 }
 
+# =============================================================================
+# Orchestration: emerge pipeline, passwords, readiness, main
+# =============================================================================
+
 step_install(){
-  phase "install"
+  phase "install (INIT_SYSTEM=${INIT_SYSTEM:-systemd})"
   chroot_cmd "source /etc/profile && env-update || true"
   chroot_bootstrap_portage
   chroot_write_make_conf
@@ -1083,11 +1464,11 @@ step_install(){
   chroot_create_swap
   chroot_emerge_all
   chroot_kernel_deploy
-  chroot_write_mdadm_fstab
+  chroot_write_fstab
   chroot_dracut_initramfs
   chroot_enable_services
   chroot_install_grub
-  mirror_esp_to_disk_b
+  mirror_esp_to_additional_disks
   chroot_create_first_user
 }
 
@@ -1119,7 +1500,9 @@ reboot_readiness_report(){
 
   mountpoint -q "$TARGET" || missing+=("target mounted: $TARGET")
   [[ -f "$TARGET/etc/fstab" ]] || missing+=("/etc/fstab")
-  [[ -f "$TARGET/etc/mdadm.conf" ]] || missing+=("/etc/mdadm.conf")
+  if [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]]; then
+    [[ -f "$TARGET/etc/mdadm.conf" ]] || missing+=("/etc/mdadm.conf")
+  fi
   [[ -f "$TARGET/boot/grub/grub.cfg" ]] || missing+=("/boot/grub/grub.cfg")
 
   if ! ls "$TARGET/boot"/kernel-* "$TARGET/boot"/vmlinuz-* >/dev/null 2>&1; then
@@ -1175,7 +1558,7 @@ finish_msg(){
 }
 
 # =============================================================================
-# Main
+# main
 # =============================================================================
 
 main(){
@@ -1197,9 +1580,12 @@ main(){
     need_cmd "$c"
   done
 
+  install_disks_resolve
   check_internet
   resolve_stage3
   require_inputs
+  export INIT_SYSTEM
+  announce_install_profile
   init_state
 
   if [[ "$RESET" -eq 1 ]]; then rm -f "$STATE"; init_state; fi

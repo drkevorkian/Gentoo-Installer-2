@@ -1,0 +1,138 @@
+# Gentoo UEFI installer
+
+[`gentoo_installer.sh`](gentoo_installer.sh) installs Gentoo with **UEFI**, **ext4** on `/`, optional **mdadm** RAID when multiple disks are listed, optional GUI (Plasma, GNOME, Xfce), and optional server packages. Run it from a live environment as **root**.
+
+See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume options.
+
+## Requirements
+
+- **Architecture:** amd64  
+- **Firmware:** UEFI  
+- **Network:** stage3 download, Portage sync, binary kernel  
+- **Host tools:** see the `need_cmd` loop in `main()` (`wget`, `md5sum` when verification is on, `sgdisk`, `mdadm`, `chroot`, …)
+
+## Disks and RAID
+
+### `INSTALL_DISKS`
+
+Space-separated **whole disk** paths (e.g. `/dev/sda /dev/sdb /dev/sdc` or a single `/dev/nvme0n1`).
+
+- **If empty (default):** the installer uses legacy **`DISK_A`** and **`DISK_B`** (same behavior as older versions: two disks).
+- **One disk:** GPT layout is EFI (`EF00`) + Linux root (`8300`) on partition 2. No mdadm array; root is mounted directly. **`ROOT_RAID_LEVEL`** is ignored (a notice is printed if set).
+- **Two or more disks:** each disk gets EFI + Linux RAID (`FD00`) on partition 2; **`mdadm`** builds **`$MD`** (default `/dev/md0`) across **all** disks using **`ROOT_RAID_LEVEL`**.
+
+Partition names follow **`disk_part()`** in the script (e.g. `/dev/sda1` vs `/dev/nvme0n1p1`).
+
+### `ROOT_RAID_LEVEL` (multi-disk only)
+
+| Level   | Minimum disks | Notes |
+|---------|----------------|-------|
+| raid0   | 2 | Stripe |
+| raid1   | 2 | Mirror; internal bitmap |
+| raid4   | 3 | |
+| raid5   | 3 | |
+| raid6   | 4 | |
+| raid10  | 4, **even** count | Uses **`ROOT_RAID10_LAYOUT`** (default **`n2`**) |
+
+### `ROOT_RAID10_LAYOUT`
+
+Passed to **`mdadm --layout=`** for **raid10** only (e.g. **`n2`**, **`o2`**, **`f2`**).
+
+### `CONFIRM_ERASE`
+
+Must equal:
+
+```text
+ERASE-<basename1>-<basename2>-...
+```
+
+where basenames are **`basename /dev/...`** for each install disk, sorted **lexicographically** (`LC_ALL=C`). Examples:
+
+- One disk `/dev/nvme0n1` → **`CONFIRM_ERASE=ERASE-nvme0n1`**
+- Legacy two disks `DISK_A=/dev/sda` `DISK_B=/dev/sdb` → **`ERASE-sda-sdb`**
+- **`INSTALL_DISKS="/dev/sdc /dev/sda /dev/sdb"`** → **`ERASE-sda-sdb-sdc`**
+
+### ESP / GRUB
+
+- **`/boot/efi`** uses the **first** disk’s EFI partition.
+- Extra disks mount at **`/boot/efi2`**, **`/boot/efi3`**, … inside the target.
+- **`GRUB_INSTALL_TO_DISK_B=YES`** (default): after **`grub-install`** on the primary ESP, the installer runs **`grub-install`** + **`rsync`** to each additional ESP (**`mirror_esp_to_additional_disks`**).
+
+### Root volume and initramfs
+
+- **Single disk:** kernel cmdline uses **`root=UUID=…`** without **`rd.auto`**; dracut is built **without** the **`mdraid`** module.
+- **RAID:** **`rd.auto=1`** and dracut **`mdraid`**; **`/etc/mdadm.conf`** is populated from **`mdadm --detail --scan`**.
+
+## Init system: systemd vs OpenRC
+
+**`INIT_SYSTEM`** selects stage3, Portage profile suffix (`…/systemd` vs `…/openrc`), and **`systemctl`** vs **`rc-update`**.
+
+| `INIT_SYSTEM` | Auto stage3 flavor (when `STAGE3_FLAVOR_AUTO=YES`) |
+|---------------|------------------------------------------------------|
+| `systemd` (default) | `systemd` or `hardened-systemd` if `PROFILE_TARGET` starts with `hardened` |
+| `openrc` | `openrc` or `hardened-openrc` for hardened targets |
+
+## Important variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ARMED` | `YES` | Must be `YES` |
+| `WIPE_DISKS` | `YES` | Must be `YES` |
+| `INSTALL_DISKS` | *(empty)* | Space-separated disks; empty ⇒ `DISK_A` + `DISK_B` |
+| `DISK_A`, `DISK_B` | `/dev/sda`, `/dev/sdb` | Used only when **`INSTALL_DISKS`** is empty |
+| `CONFIRM_ERASE` | *(empty)* | Must match the **`ERASE-…`** formula above |
+| `ROOT_RAID_LEVEL` | `raid0` | `raid0`–`raid10` for multi-disk |
+| `ROOT_RAID10_LAYOUT` | `n2` | mdadm layout for raid10 |
+| `MD` | `/dev/md0` | RAID device node (multi-disk) |
+| `INIT_SYSTEM` | `systemd` | `systemd` or `openrc` |
+| `PROFILE_TARGET` | `hardened-plasma` | Portage profile selection |
+| `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** |
+
+Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at the top of [`gentoo_installer.sh`](gentoo_installer.sh).
+
+## Download verification
+
+When **`STAGE3_VERIFY_MD5=YES`**, the installer downloads **`${STAGE3}.DIGESTS`**, checks **MD5** for the tarball basename, and refuses to extract on mismatch.
+
+## Stage3 / `INIT_SYSTEM` consistency
+
+Manual **`STAGE3`** URLs must match **`INIT_SYSTEM`** (openrc vs systemd tarball names). See script **`validate_init_stage3_consistency`**.
+
+## Examples
+
+Legacy two-disk RAID0 (sorted erase token **`ERASE-sda-sdb`**):
+
+```bash
+sudo ARMED=YES WIPE_DISKS=YES CONFIRM_ERASE=ERASE-sda-sdb ./gentoo_installer.sh
+```
+
+Single NVMe disk:
+
+```bash
+sudo INSTALL_DISKS=/dev/nvme0n1 CONFIRM_ERASE=ERASE-nvme0n1 \
+  ARMED=YES WIPE_DISKS=YES ./gentoo_installer.sh
+```
+
+Three-disk RAID5:
+
+```bash
+sudo INSTALL_DISKS="/dev/sda /dev/sdb /dev/sdc" ROOT_RAID_LEVEL=raid5 \
+  CONFIRM_ERASE=ERASE-sda-sdb-sdc ARMED=YES WIPE_DISKS=YES ./gentoo_installer.sh
+```
+
+OpenRC server on two disks:
+
+```bash
+sudo INIT_SYSTEM=openrc PROFILE_TARGET=server \
+  ARMED=YES WIPE_DISKS=YES CONFIRM_ERASE=ERASE-sda-sdb ./gentoo_installer.sh
+```
+
+## Limitations
+
+- **Whole-disk paths** only (partition numbers are fixed: EFI `1`, root or RAID member `2`).
+- **RAID levels** supported are those wired in **`ROOT_RAID_LEVEL`** (0, 1, 4, 5, 6, 10).
+- **CI:** validate installs in your own VM or hardware.
+
+## Resume and reset
+
+State file under the log directory; see **`RESUME`**, **`--reset`**, and **`--reset-phase`** in `main()`.
