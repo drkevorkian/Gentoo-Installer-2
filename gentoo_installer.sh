@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=2
+# INSTALLER_VERSION=3
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -867,7 +867,11 @@ verify_stage3_tarball_md5(){
   ' "$dig_tmp")"
   rm -f "$dig_tmp"
   [[ -n "$parse_out" ]] || die "No SHA512/SHA256/MD5 checksum for $base in $dig_url"
-  read -r algo expected <<< "$parse_out"
+  # Shell IFS is $'\n\t' only; read would treat "sha512 <hex>" as one field. Use awk for whitespace fields.
+  parse_out="$(printf '%s' "$parse_out" | tr -d '\r')"
+  algo="$(printf '%s\n' "$parse_out" | awk 'NF>=2 { print $1; exit }')"
+  expected="$(printf '%s\n' "$parse_out" | awk 'NF>=2 { print $2; exit }')"
+  [[ -n "$algo" && -n "$expected" ]] || die "Could not parse digest algorithm and hash from DIGESTS (line: ${parse_out:0:120})"
   case "$algo" in
     sha512) need_cmd sha512sum; actual="$(sha512sum "$dst" | awk '{print $1}')" ;;
     sha256) need_cmd sha256sum; actual="$(sha256sum "$dst" | awk '{print $1}')" ;;
