@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
+# INSTALLER_VERSION=2
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -20,6 +21,7 @@
 # - Root password defaults to FIRST_USER_PASSWORD
 # - Prints SAFE TO REBOOT readiness report
 # - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
+# - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub raw script before install
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -107,6 +109,12 @@ IFS=$'\n\t'
 # YES: aggressive cleanup (swapoff -a, stop all /dev/md*) — intended for Gentoo LiveCD / dedicated install VM only.
 : "${INSTALLER_LIVE_ENV:=YES}"
 
+# Upstream copy on GitHub (raw gentoo_installer.sh must carry the same # INSTALLER_VERSION= line).
+: "${INSTALLER_GITHUB_REPO:=drkevorkian/Gentoo-Installer-2}"
+: "${INSTALLER_GITHUB_REF:=main}"
+: "${CHECK_UPSTREAM:=YES}"
+: "${UPSTREAM_STRICT:=NO}"
+
 # =============================================================================
 # Logging, paths, and session state
 # =============================================================================
@@ -180,6 +188,69 @@ phase(){ echo; echo "===== PHASE: $* ====="; }
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 disk_base(){ basename "$1"; }
+
+# GitHub raw script carries `# INSTALLER_VERSION=N`; bump N when releasing meaningful changes.
+installer_version_from_file(){
+  local f="$1"
+  grep -m1 '^# INSTALLER_VERSION=' "$f" 2>/dev/null \
+    | sed -e 's/^# INSTALLER_VERSION=//' -e 's/[[:space:]]*$//' | tr -d '\r'
+}
+
+check_installer_upstream(){
+  [[ "${CHECK_UPSTREAM:-YES}" == "YES" ]] || return 0
+  local self url tmp v_loc v_rem strict rc=1
+  strict="${UPSTREAM_STRICT:-NO}"
+  self="${BASH_SOURCE[0]}"
+  v_loc="$(installer_version_from_file "$self")"
+  if [[ -z "$v_loc" ]]; then
+    echo "NOTE: Missing # INSTALLER_VERSION= in this script; skipping GitHub version check." >&2
+    return 0
+  fi
+  if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+    echo "NOTE: Neither wget nor curl found; skipping GitHub version check." >&2
+    return 0
+  fi
+  url="https://raw.githubusercontent.com/${INSTALLER_GITHUB_REPO}/${INSTALLER_GITHUB_REF}/gentoo_installer.sh"
+  tmp="${TMPDIR:-/tmp}/gentoo-installer-upstream.$$.$RANDOM.txt"
+  if wget -q --timeout=20 -O "$tmp" "$url" 2>/dev/null; then rc=0
+  elif curl -fsS --connect-timeout 15 --max-time 60 -o "$tmp" "$url" 2>/dev/null; then rc=0
+  fi
+  if [[ "$rc" -ne 0 ]] || [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    echo "NOTE: Could not download upstream script from GitHub; skipping version check." >&2
+    echo "      (${url})" >&2
+    return 0
+  fi
+  v_rem="$(installer_version_from_file "$tmp")"
+  rm -f "$tmp"
+  if [[ -z "$v_rem" ]]; then
+    echo "NOTE: Upstream script has no # INSTALLER_VERSION=; skipping comparison." >&2
+    return 0
+  fi
+  if [[ "$v_rem" == "$v_loc" ]]; then
+    echo "Installer script version ${v_loc} matches GitHub (${INSTALLER_GITHUB_REPO}@${INSTALLER_GITHUB_REF})."
+    return 0
+  fi
+  local newer outdated=0
+  newer="$(printf '%s\n' "$v_loc" "$v_rem" | sort -V | tail -n1)"
+  if [[ "$newer" == "$v_rem" && "$v_rem" != "$v_loc" ]]; then outdated=1; fi
+  if [[ "$outdated" -eq 0 ]]; then
+    return 0
+  fi
+  local gh_page="https://github.com/${INSTALLER_GITHUB_REPO}/blob/${INSTALLER_GITHUB_REF}/gentoo_installer.sh"
+  echo "" >&2
+  echo "================================================================" >&2
+  echo "  UPDATE: GitHub has a newer installer (upstream version ${v_rem}; this copy is ${v_loc})." >&2
+  echo "  Page:  ${gh_page}" >&2
+  echo "  Raw:   ${url}" >&2
+  echo "================================================================" >&2
+  echo "" >&2
+  if [[ "$strict" == "YES" ]]; then
+    die "Refusing to run outdated installer (UPSTREAM_STRICT=YES). Refresh gentoo_installer.sh from GitHub or set UPSTREAM_STRICT=NO."
+  fi
+  echo "  Continuing with this file. Set CHECK_UPSTREAM=NO to skip this check." >&2
+  echo "" >&2
+}
 
 # Walk from any block device (partition, mapper, md, …) up to underlying TYPE=disk nodes.
 # Prints unique whole-disk paths (for comparisons). Handles md RAID via /sys/.../slaves when lsblk PKNAME is empty.
@@ -1659,6 +1730,7 @@ main(){
     printf 'CONFIRM_ERASE=%s\n' "$(confirm_erase_expected)"
     exit 0
   fi
+  check_installer_upstream
   for c in sgdisk mdadm wipefs partprobe udevadm rsync tar mount umount findmnt lsblk mkfs.vfat mkfs.ext4 mktemp yes blockdev wget chroot blkid sed stat grep awk curl dd fallocate mkswap; do
     need_cmd "$c"
   done

@@ -6,6 +6,10 @@
 
 See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume options.
 
+## Upstream version check
+
+Before other phases (unless **`CHECK_UPSTREAM=NO`**), the script downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares the `# INSTALLER_VERSION=` line to your copy. If GitHub is newer, a warning is printed; **`UPSTREAM_STRICT=YES`** aborts until you refresh the script. Override repo/ref with **`INSTALLER_GITHUB_REPO`** and **`INSTALLER_GITHUB_REF`** if you fork.
+
 ## Requirements
 
 - **Architecture:** amd64  
@@ -91,8 +95,14 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** using **SHA512** if present, else **SHA256**, else **MD5** (name kept for backward compatibility) |
 | `INSTALL_SERVER_STACK` | `NO` | `YES` installs Apache, MariaDB, PHP, phpMyAdmin, vsftpd (large attack surface; enable only when needed) |
 | `INSTALLER_LIVE_ENV` | `YES` | `YES`: **`swapoff -a`** and stop **all** `/dev/md*` before partitioning (typical LiveCD). `NO`: only unmount **`$TARGET`** and stop **`$MD`** — use on multi-purpose hosts only with care |
+| `CHECK_UPSTREAM` | `YES` | Compare **`# INSTALLER_VERSION=`** to GitHub raw script before install |
+| `UPSTREAM_STRICT` | `NO` | `YES`: exit if GitHub has a higher **`INSTALLER_VERSION`** |
+| `INSTALLER_GITHUB_REPO` | `drkevorkian/Gentoo-Installer-2` | **`owner/repo`** for **`raw.githubusercontent.com`** |
+| `INSTALLER_GITHUB_REF` | `main` | Branch or tag name on GitHub |
 
 Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at the top of [`gentoo_installer.sh`](gentoo_installer.sh).
+
+Bump **`# INSTALLER_VERSION=`** near the top of the script when you publish meaningful changes so the check stays meaningful.
 
 ## Download verification
 
