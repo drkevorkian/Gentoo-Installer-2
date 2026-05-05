@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=4
+# INSTALLER_VERSION=5
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -179,6 +179,9 @@ on_err(){
   echo "Log       : $LOG"
   echo "State     : $STATE"
   echo "========================================================="
+  if [[ "$cmd" == *'chroot '* ]]; then
+    echo "Hint: chroot exit is usually the inner bash script failing. Search the log for the last CHROOT> line, then retry with CHROOT_DEBUG=YES." >&2
+  fi
   echo
   exit "$ec"
 }
@@ -1061,15 +1064,32 @@ chroot_fill_base_env(){
   )
 }
 
+# Path to coreutils `env` *inside* $TARGET (required for env -i in chroot).
+chroot_env_exe(){
+  if [[ -x "$TARGET/usr/bin/env" ]]; then
+    printf '%s\n' /usr/bin/env
+  elif [[ -x "$TARGET/bin/env" ]]; then
+    printf '%s\n' /bin/env
+  else
+    die "chroot: 'env' not found under ${TARGET} (expected stage3 with /usr/bin/env). Extract stage3 or remount ${TARGET}."
+  fi
+}
+
 chroot_cmd(){
   local cmd="$1"
   ensure_chrootprep
 
   local -a base_env
   chroot_fill_base_env base_env
+  local envp
+  envp="$(chroot_env_exe)"
 
   echo "CHROOT> $cmd"
-  chroot "$TARGET" /usr/bin/env -i "${base_env[@]}" /bin/bash -lc "$cmd"
+  if [[ "${CHROOT_DEBUG:-NO}" == "YES" ]]; then
+    chroot "$TARGET" "$envp" -i "${base_env[@]}" /bin/bash -x -l -c "$cmd"
+  else
+    chroot "$TARGET" "$envp" -i "${base_env[@]}" /bin/bash -l -c "$cmd"
+  fi
 }
 
 chroot_script(){
@@ -1080,14 +1100,21 @@ chroot_script(){
 
   local -a base_env
   chroot_fill_base_env base_env
+  local envp
+  envp="$(chroot_env_exe)"
 
   local name="/root/.installer.$(date +%s).$$.$RANDOM.sh"
   local host_path="$TARGET$name"
-  cat > "$host_path"
+  # Strip CR so heredocs from CRLF-checked-out installer repos do not break inside chroot (set: invalid option, etc.).
+  tr -d '\r' > "$host_path"
   chmod 0700 "$host_path"
 
   echo "CHROOT> (script) $name"
-  chroot "$TARGET" /usr/bin/env -i "${base_env[@]}" "${envs[@]}" /bin/bash "$name"
+  if [[ "${CHROOT_DEBUG:-NO}" == "YES" ]]; then
+    chroot "$TARGET" "$envp" -i "${base_env[@]}" "${envs[@]}" /bin/bash -x "$name"
+  else
+    chroot "$TARGET" "$envp" -i "${base_env[@]}" "${envs[@]}" /bin/bash "$name"
+  fi
   local rc=$?
   rm -f "$host_path" 2>/dev/null || true
   return "$rc"

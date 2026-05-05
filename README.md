@@ -151,6 +151,8 @@ sudo INIT_SYSTEM=openrc PROFILE_TARGET=server INSTALL_SERVER_STACK=YES \
 
 ## Limitations
 
+- **Line endings:** If you edit this repo on Windows, keep **`gentoo_installer.sh`** checked out with **LF** (not CRLF). The installer strips carriage returns from chroot heredocs, but the main script itself should be LF-only on the LiveCD.
+- **Chroot failures:** If the crash **`Command`** line shows **`chroot`**, the failure is almost always inside the nested bash script. Re-run with **`CHROOT_DEBUG=YES`** for **`bash -x`** in the target, and read **`gentoo_install.log`** from the last **`CHROOT>`** line upward.
 - **Whole-disk paths** only (partition numbers are fixed: EFI `1`, root or RAID member `2`); the script enforces this with **`lsblk`**.
 - **RAID levels** supported are those wired in **`ROOT_RAID_LEVEL`** (0, 1, 4, 5, 6, 10).
 - **Firmware:** UEFI only (no legacy BIOS boot flow in this script).
