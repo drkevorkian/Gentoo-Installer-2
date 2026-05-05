@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=6
+# INSTALLER_VERSION=1.3.5
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -22,6 +22,7 @@
 # - Prints SAFE TO REBOOT readiness report
 # - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
 # - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
+# - Self-update runs first at process entry (installer_gate_self_update) before main install flow
 # - gentoo_installer.conf next to this script: loaded before defaults (env vars win); auto-saved before self-update
 #
 set -Eeuo pipefail
@@ -485,6 +486,22 @@ check_installer_upstream(){
   echo "" >&2
 }
 
+# Runs before main(): --help without root; then need_root + GitHub self-update (earliest full-script hook).
+installer_gate_self_update(){
+  local -a INSTALLER_INVOCATION_ARGV=("$@")
+  local _a
+  for _a in "$@"; do
+    case "$_a" in
+      -h|--help)
+        echo "Usage: $0 [--reset] [--reset-phase <phase>] [--print-erase-token]"
+        exit 0
+        ;;
+    esac
+  done
+  need_root
+  check_installer_upstream INSTALLER_INVOCATION_ARGV
+}
+
 # Walk from any block device (partition, mapper, md, …) up to underlying TYPE=disk nodes.
 # Prints unique whole-disk paths (for comparisons). Handles md RAID via /sys/.../slaves when lsblk PKNAME is empty.
 backing_physical_disks(){
@@ -796,15 +813,106 @@ validate_init_stage3_consistency(){
   fi
 }
 
-announce_install_profile(){
+print_install_selection_banner(){
+  local sv d
+  sv="$(installer_version_from_file "${BASH_SOURCE[0]}" 2>/dev/null || echo "?")"
+  phase "install selection — what will be installed"
   echo ""
-  echo "======== INSTALL PROFILE (verify before proceeding) ========"
-  echo "INIT_SYSTEM     : ${INIT_SYSTEM:-systemd}   # drives stage3, profiles, systemctl vs rc-update"
-  echo "PROFILE_TARGET  : ${PROFILE_TARGET:-}"
-  echo "STAGE3_FLAVOR   : ${STAGE3_FLAVOR:-}"
-  echo "STAGE3 URL      : ${STAGE3:-}"
-  echo "INSTALL_DISKS   : ${INSTALL_DISKS:-}" "(resolved: ${INSTALL_DISK_ARR[*]:-unset})"
-  echo "==========================================================="
+  echo "################################################################"
+  echo "#  INSTALL SELECTION — your choices / what will be installed"
+  echo "################################################################"
+  echo "Script path       : ${BASH_SOURCE[0]}"
+  echo "INSTALLER_VERSION : ${sv}"
+  echo "Log file          : ${LOG}"
+  echo "State file        : ${STATE}"
+  echo "Target mountpoint : ${TARGET}"
+  echo "CONFIRM_ERASE     : ${CONFIRM_ERASE:-}"
+  echo ""
+  echo "--- Disks (GPT: EFI partition 1; Linux root or RAID member 2) ---"
+  for d in "${INSTALL_DISK_ARR[@]}"; do
+    echo "  * ${d}"
+    lsblk -dn -o SIZE,MODEL,SERIAL,TRAN "$d" 2>/dev/null | sed 's/^/      /' || true
+  done
+  echo ""
+  echo "INSTALL_DISKS (raw): ${INSTALL_DISKS:-}"
+  echo ""
+  if [[ "${INSTALL_ROOT_IS_RAID:-0}" -eq 1 ]]; then
+    echo "Root storage      : mdadm ${ROOT_RAID_LEVEL} on ${MD} (${#INSTALL_DISK_ARR[@]} disk(s))"
+  else
+    echo "Root storage      : single volume on partition (no md RAID for root)"
+  fi
+  echo "Filesystem        : ${ROOT_FS}   Swap file: ${SWAP_SIZE_GB} GiB   ESP: ${EFI_SIZE_MIB} MiB"
+  echo ""
+  echo "--- Stage3 / Portage profile ---"
+  echo "INIT_SYSTEM       : ${INIT_SYSTEM}"
+  echo "PROFILE_TARGET    : ${PROFILE_TARGET}"
+  echo "STAGE3_FLAVOR     : ${STAGE3_FLAVOR}   STAGE3_FLAVOR_AUTO: ${STAGE3_FLAVOR_AUTO}"
+  echo "STAGE3 tarball    : ${STAGE3}"
+  echo "Verify DIGESTS    : ${STAGE3_VERIFY_MD5}"
+  echo ""
+  echo "--- Features ---"
+  echo "GUI               : ${GUI_ENABLE} (${GUI_FLAVOR})   NetworkManager: ${GUI_ENABLE_NETWORKMANAGER}"
+  echo "Server stack      : ${INSTALL_SERVER_STACK}   Firmware pkgs: ${INSTALL_FIRMWARE}   Node.js: ${INSTALL_NODE}"
+  echo "MAKE_JOBS_DEFAULT : ${MAKE_JOBS_DEFAULT}"
+  echo ""
+  echo "--- Accounts (passwords never printed) ---"
+  echo "FIRST_USER_ENABLE : ${FIRST_USER_ENABLE}   FIRST_USER_NAME: ${FIRST_USER_NAME}"
+  echo ""
+  echo "--- Safety flags ---"
+  echo "ARMED             : ${ARMED}   WIPE_DISKS: ${WIPE_DISKS}   RESUME: ${RESUME}"
+  echo "INSTALLER_LIVE_ENV: ${INSTALLER_LIVE_ENV}"
+  echo ""
+  echo "################################################################"
+  echo "#  Proceeding with destructive disk steps and chroot install below."
+  echo "################################################################"
+  echo ""
+}
+
+announce_install_profile(){ print_install_selection_banner; }
+
+print_install_completion_report(){
+  local mp vk k
+  phase "install result — what was installed / configured"
+  echo ""
+  echo "################################################################"
+  echo "#  INSTALL RESULT — on-disk system after this run"
+  echo "################################################################"
+  mp="$(readlink -f "$TARGET/etc/portage/make.profile" 2>/dev/null || true)"
+  if [[ -n "$mp" ]]; then
+    echo "Active Portage profile : $mp"
+  else
+    echo "Active Portage profile : (not found under ${TARGET})"
+  fi
+  vk="$(shopt -s nullglob; printf '%s ' "$TARGET"/boot/vmlinuz-* "$TARGET"/boot/kernel-* 2>/dev/null; shopt -u nullglob)"
+  vk="${vk%"${vk##*[![:space:]]}"}"
+  echo "Kernel images in /boot: ${vk:-none}"
+  k="$(shopt -s nullglob; printf '%s ' "$TARGET"/boot/initramfs-* "$TARGET"/boot/initrd* 2>/dev/null; shopt -u nullglob)"
+  k="${k%"${k##*[![:space:]]}"}"
+  echo "Initramfs in /boot     : ${k:-none}"
+  if [[ "${FIRST_USER_ENABLE:-NO}" == "YES" && -n "${FIRST_USER_NAME:-}" ]]; then
+    if grep -qE "^${FIRST_USER_NAME}:" "$TARGET/etc/passwd" 2>/dev/null; then
+      echo "First user             : ${FIRST_USER_NAME} (present in target /etc/passwd)"
+    else
+      echo "First user             : ${FIRST_USER_NAME} (not found on target — check log)"
+    fi
+  fi
+  echo ""
+  echo "State milestones (DONE lines):"
+  if [[ -f "$STATE" ]]; then
+    grep '^DONE ' "$STATE" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+  else
+    echo "  (no state file)"
+  fi
+  echo ""
+  if [[ -f "$TARGET/etc/fstab" ]]; then
+    echo "/etc/fstab on target (first lines):"
+    sed -n '1,16p' "$TARGET/etc/fstab" | sed 's/^/  /'
+  else
+    echo "/etc/fstab : missing"
+  fi
+  echo ""
+  echo "Services: enabled per INIT_SYSTEM=${INIT_SYSTEM} (ssh + optional GUI NM + optional server stack)."
+  echo "################################################################"
   echo ""
 }
 
@@ -1343,7 +1451,25 @@ location = /var/db/repos/gentoo
 sync-type = webrsync
 EOC
 
+# emerge-webrsync often exits 1 when timestamp.x disagrees with the mirror (resume, clock skew, gemato).
+set +e
 emerge-webrsync
+wr=$?
+set -e
+if [[ "$wr" -ne 0 ]]; then
+  echo "NOTE: emerge-webrsync exited $wr — clearing metadata/timestamp.x and retrying." >&2
+  rm -f /var/db/repos/gentoo/metadata/timestamp.x 2>/dev/null || true
+  emerge-webrsync || {
+    echo "NOTE: emerge-webrsync still failing; trying --revert (older snapshot)." >&2
+    emerge-webrsync --revert || {
+      echo "NOTE: removing partial Portage tree and running full webrsync again." >&2
+      rm -rf /var/db/repos/gentoo
+      mkdir -p /var/db/repos/gentoo
+      emerge-webrsync
+    }
+  }
+fi
+
 test -d /var/db/repos/gentoo/profiles || { echo "ERROR: repo profiles missing"; exit 1; }
 
 plist="$(eselect profile list)"
@@ -1954,6 +2080,7 @@ reboot_readiness_report(){
 }
 
 finish_msg(){
+  print_install_completion_report
   reboot_readiness_report
   echo "DONE."
   echo "Log  : $LOG"
@@ -1985,8 +2112,6 @@ main(){
     esac
   done
 
-  need_root
-  check_installer_upstream INSTALLER_INVOCATION_ARGV
   if [[ "$PRINT_ERASE_TOKEN" -eq 1 ]]; then
     need_cmd lsblk
     install_disks_resolve
@@ -2026,4 +2151,5 @@ main(){
   finish_msg
 }
 
+installer_gate_self_update "$@"
 main "$@"

@@ -6,9 +6,13 @@
 
 See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume options.
 
+## Install summary (before and after the run)
+
+On startup, **`installer_gate_self_update`** runs as soon as the script can (right after optional **`--help`** without root). It calls **`need_root`**, then the [upstream version check](#upstream-version-check) so the live copy can **`exec`** into a newer script before any install work. After disk resolution, network check, stage3 selection, and **`require_inputs`**, the script prints an **install selection** banner: disks, RAID layout, stage3, GUI/server flags, and safety variables—**this is what you asked for and what will be installed**. When the pipeline completes, **`finish_msg`** prints an **install result** section: active Portage profile under **`$TARGET`**, kernel and initramfs names in **`/boot`**, first-user presence in **`/etc/passwd`**, **`DONE`** lines from the state file, and the first lines of **`/etc/fstab`**.
+
 ## Upstream version check
 
-After **`need_root`** (unless **`CHECK_UPSTREAM=NO`**), the script downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** to your copy.
+At process entry, **`installer_gate_self_update`** runs **`need_root`** and then (unless **`CHECK_UPSTREAM=NO`**) downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** to your copy.
 
 - **`UPSTREAM_AUTO_UPDATE=YES`** (default): if GitHub is newer, the download is validated (**shebang**, **`bash -n`**), current settings are written to **`gentoo_installer.conf`** (see below), then **`chmod +x`**, replace-in-place, and **`exec`** with the **same argv** plus inherited environment so the new script reloads your choices.
 - **`UPSTREAM_AUTO_UPDATE=NO`**: only print a warning; **`UPSTREAM_STRICT=YES`** then aborts if GitHub is newer.
@@ -130,6 +134,8 @@ Gentoo’s **`latest-stage3-amd64-*.txt`** index files are **OpenPGP cleartext-s
 ## Stage3 / `INIT_SYSTEM` consistency
 
 Manual **`STAGE3`** URLs must match **`INIT_SYSTEM`** (openrc vs systemd tarball names). See script **`validate_init_stage3_consistency`**.
+
+**Portage / `emerge-webrsync`:** On **`RESUME=YES`** or if a previous run left **`/var/db/repos/gentoo`** half-synced, **`emerge-webrsync`** can exit with a timestamp / gemato warning. The bootstrap script clears **`metadata/timestamp.x`**, retries, then tries **`--revert`**, then removes the partial tree and re-fetches if needed.
 
 ## Examples
 
