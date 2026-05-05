@@ -88,7 +88,7 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `MD` | `/dev/md0` | RAID device node (multi-disk) |
 | `INIT_SYSTEM` | `systemd` | `systemd` or `openrc` |
 | `PROFILE_TARGET` | `hardened-plasma` | Portage profile selection |
-| `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** |
+| `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** using **SHA512** if present, else **SHA256**, else **MD5** (name kept for backward compatibility) |
 | `INSTALL_SERVER_STACK` | `NO` | `YES` installs Apache, MariaDB, PHP, phpMyAdmin, vsftpd (large attack surface; enable only when needed) |
 | `INSTALLER_LIVE_ENV` | `YES` | `YES`: **`swapoff -a`** and stop **all** `/dev/md*` before partitioning (typical LiveCD). `NO`: only unmount **`$TARGET`** and stop **`$MD`** — use on multi-purpose hosts only with care |
 
@@ -96,7 +96,7 @@ Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at
 
 ## Download verification
 
-When **`STAGE3_VERIFY_MD5=YES`**, the installer downloads **`${STAGE3}.DIGESTS`**, checks **MD5** for the tarball basename, and refuses to extract on mismatch.
+When **`STAGE3_VERIFY_MD5=YES`**, the installer downloads **`${STAGE3}.DIGESTS`** and checks the tarball using **SHA512** (preferred), **SHA256**, or **MD5**, matching the sections present in the file. Gentoo often omits MD5 now; the variable name is unchanged for compatibility.
 
 Gentoo’s **`latest-stage3-amd64-*.txt`** index files are **OpenPGP cleartext-signed**; the installer skips the armor and comment lines and reads the **`…/stage3-….tar.xz`** path line.
 

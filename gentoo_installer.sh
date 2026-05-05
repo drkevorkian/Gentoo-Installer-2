@@ -13,7 +13,7 @@
 # - INSTALLER_LIVE_ENV=YES (default): preflight stops all md + swapoff -a (LiveCD); NO: only $MD
 # - FULL rerunnable phases via state file
 # - INIT_SYSTEM=systemd|openrc selects stage3, Portage profiles (.../systemd vs .../openrc), and service startup (systemctl vs rc-update)
-# - Stage3 tarball MD5 verified against mirror ${STAGE3}.DIGESTS when STAGE3_VERIFY_MD5=YES
+# - Stage3 tarball verified against mirror ${STAGE3}.DIGESTS (SHA512, else SHA256, else MD5) when STAGE3_VERIFY_MD5=YES
 # - Fixes ERR-trap boolean-test crash by never running standalone [[ ... ]] in run_step()
 # - Fixes dracut tmpdir leak by env -i in chroot + TMPDIR=/var/tmp
 # - Forces initramfs output to /boot/initramfs-<kver>.img
@@ -56,7 +56,7 @@ IFS=$'\n\t'
 : "${STAGE3_FLAVOR:=systemd}"        # systemd|openrc|hardened-systemd|hardened-openrc (auto overrides when STAGE3_FLAVOR_AUTO=YES)
 : "${STAGE3_AUTOBUILDS_BASE:=https://distfiles.gentoo.org/releases/amd64/autobuilds}"
 : "${INIT_SYSTEM:=systemd}"           # systemd|openrc — must match stage3 tarball / profile init
-: "${STAGE3_VERIFY_MD5:=YES}"       # YES: verify tarball MD5 from mirror ${URL}.DIGESTS before extract
+: "${STAGE3_VERIFY_MD5:=YES}"       # YES: verify tarball vs mirror ${URL}.DIGESTS (prefers SHA512; MD5 name kept for compat)
 
 # Profile / GUI
 
@@ -770,26 +770,41 @@ stage3_cache_path(){ echo "${STAGE3_CACHE_DIR}/$(basename "$STAGE3")"; }
 verify_stage3_tarball_md5(){
   local dst="${1:?}"
   [[ "${STAGE3_VERIFY_MD5:-YES}" == YES ]] || return 0
-  need_cmd md5sum
   local dig_url="${STAGE3}.DIGESTS"
-  local dig_tmp base expected actual
+  local dig_tmp base algo expected actual parse_out
   base="$(basename "$STAGE3")"
   dig_tmp="$(mktemp -p "$STAGE3_CACHE_DIR" ".digests.XXXXXX")"
   wget -qO "$dig_tmp" "$dig_url" || die "Failed fetching DIGESTS: $dig_url"
-  expected="$(awk -v fn="$base" '
-    /^# MD5/ { want=1; next }
-    /^#/ { want=0 }
-    want && NF>=2 {
+  # Upstream .DIGESTS files are OpenPGP-signed and often list SHA512 only (no MD5).
+  parse_out="$(awk -v fn="$base" '
+    /^# SHA512/ { sect="sha512"; next }
+    /^# SHA256/ { sect="sha256"; next }
+    /^# MD5/    { sect="md5"; next }
+    /^#/       { sect=""; next }
+    /^-----/   { sect=""; next }
+    /^Hash:/   { next }
+    sect != "" && NF>=2 {
       f=$2
       sub(/^\*/, "", f)
-      if (f == fn) { print $1; exit }
+      if (f == fn) h[sect]=$1
+    }
+    END {
+      if (h["sha512"] != "") { print "sha512", h["sha512"]; exit }
+      if (h["sha256"] != "") { print "sha256", h["sha256"]; exit }
+      if (h["md5"] != "")    { print "md5", h["md5"]; exit }
     }
   ' "$dig_tmp")"
   rm -f "$dig_tmp"
-  [[ -n "$expected" ]] || die "No MD5 checksum for $base in $dig_url"
-  actual="$(md5sum "$dst" | awk '{print $1}')"
-  [[ "$actual" == "$expected" ]] || die "MD5 mismatch for $base (expected $expected got $actual)"
-  echo "MD5 verified: $base"
+  [[ -n "$parse_out" ]] || die "No SHA512/SHA256/MD5 checksum for $base in $dig_url"
+  read -r algo expected <<< "$parse_out"
+  case "$algo" in
+    sha512) need_cmd sha512sum; actual="$(sha512sum "$dst" | awk '{print $1}')" ;;
+    sha256) need_cmd sha256sum; actual="$(sha256sum "$dst" | awk '{print $1}')" ;;
+    md5)    need_cmd md5sum;    actual="$(md5sum "$dst" | awk '{print $1}')" ;;
+    *) die "Unexpected digest algorithm from DIGESTS: $algo" ;;
+  esac
+  [[ "$actual" == "$expected" ]] || die "$algo mismatch for $base (expected $expected got $actual)"
+  echo "$algo verified: $base"
 }
 
 fetch_stage3_if_needed(){
