@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=3
+# INSTALLER_VERSION=4
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -21,7 +21,7 @@
 # - Root password defaults to FIRST_USER_PASSWORD
 # - Prints SAFE TO REBOOT readiness report
 # - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
-# - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub raw script before install
+# - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -113,6 +113,7 @@ IFS=$'\n\t'
 : "${INSTALLER_GITHUB_REPO:=drkevorkian/Gentoo-Installer-2}"
 : "${INSTALLER_GITHUB_REF:=main}"
 : "${CHECK_UPSTREAM:=YES}"
+: "${UPSTREAM_AUTO_UPDATE:=YES}"   # YES: replace this script with GitHub copy and exec it (same argv)
 : "${UPSTREAM_STRICT:=NO}"
 
 # =============================================================================
@@ -196,9 +197,66 @@ installer_version_from_file(){
     | sed -e 's/^# INSTALLER_VERSION=//' -e 's/[[:space:]]*$//' | tr -d '\r'
 }
 
+# Absolute path to this script file (the path we replace when self-updating).
+installer_self_abspath(){
+  local s="${BASH_SOURCE[0]}"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "$s" && return 0
+  fi
+  if readlink -f "$s" >/dev/null 2>&1; then
+    readlink -f "$s" && return 0
+  fi
+  local dir
+  dir="$(cd "$(dirname "$s")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$s")"
+}
+
+# Validate tmp, chmod +x, mv over running script path, exec with same argv. Does not return on success.
+installer_self_update_from_tmp(){
+  local tmp="$1" expect_ver="$2" ref_name="$3"
+  local -n argv_ref="$ref_name"
+  local target got
+  got="$(installer_version_from_file "$tmp")"
+  [[ "$got" == "$expect_ver" ]] || {
+    echo "FATAL: Downloaded script version mismatch (expected ${expect_ver}, got ${got})." >&2
+    return 1
+  }
+  head -n1 "$tmp" | grep -qE '^#!/usr/bin/(env )?bash' || {
+    echo "FATAL: Downloaded file is not a bash script (bad shebang)." >&2
+    return 1
+  }
+  bash -n "$tmp" 2>/dev/null || {
+    echo "FATAL: bash -n failed on downloaded script; refusing to install." >&2
+    return 1
+  }
+  target="$(installer_self_abspath)" || {
+    echo "FATAL: Could not resolve absolute path to this installer." >&2
+    return 1
+  }
+  local tdir
+  tdir="$(dirname "$target")"
+  [[ -w "$tdir" ]] || {
+    echo "FATAL: Cannot write to ${tdir}; copy the script there manually or run from a writable directory." >&2
+    return 1
+  }
+  chmod a+x "$tmp" || return 1
+  if ! mv -f "$tmp" "$target"; then
+    echo "FATAL: Could not replace ${target} with new script." >&2
+    [[ -e "$tmp" ]] && rm -f "$tmp"
+    return 1
+  fi
+  echo "" >&2
+  echo "===== Self-update: installed GitHub version ${expect_ver} -> ${target}; restarting installer =====" >&2
+  echo "" >&2
+  exec bash "$target" "${argv_ref[@]}"
+}
+
+# argv_ref_name: name of caller's array variable holding original "$@" (before option parsing).
 check_installer_upstream(){
   [[ "${CHECK_UPSTREAM:-YES}" == "YES" ]] || return 0
-  local self url tmp v_loc v_rem strict rc=1
+  local argv_ref_name="${1:?check_installer_upstream: missing argv array name}"
+
+  local self url tmp v_loc v_rem strict rc=1 target_dir
   strict="${UPSTREAM_STRICT:-NO}"
   self="${BASH_SOURCE[0]}"
   v_loc="$(installer_version_from_file "$self")"
@@ -211,7 +269,16 @@ check_installer_upstream(){
     return 0
   fi
   url="https://raw.githubusercontent.com/${INSTALLER_GITHUB_REPO}/${INSTALLER_GITHUB_REF}/gentoo_installer.sh"
-  tmp="${TMPDIR:-/tmp}/gentoo-installer-upstream.$$.$RANDOM.txt"
+  tmp=""
+  if target_dir="$(dirname "$(installer_self_abspath 2>/dev/null || echo "$self")")" && [[ -w "$target_dir" ]]; then
+    tmp="$(mktemp -p "$target_dir" ".gentoo_installer_new.XXXXXX")" || tmp=""
+  fi
+  if [[ -z "$tmp" ]]; then
+    tmp="$(mktemp "${TMPDIR:-/tmp}/gentoo_installer_new.XXXXXX")" || {
+      echo "NOTE: mktemp failed; skipping GitHub version check." >&2
+      return 0
+    }
+  fi
   if wget -q --timeout=20 -O "$tmp" "$url" 2>/dev/null; then rc=0
   elif curl -fsS --connect-timeout 15 --max-time 60 -o "$tmp" "$url" 2>/dev/null; then rc=0
   fi
@@ -222,33 +289,47 @@ check_installer_upstream(){
     return 0
   fi
   v_rem="$(installer_version_from_file "$tmp")"
-  rm -f "$tmp"
   if [[ -z "$v_rem" ]]; then
+    rm -f "$tmp"
     echo "NOTE: Upstream script has no # INSTALLER_VERSION=; skipping comparison." >&2
     return 0
   fi
   if [[ "$v_rem" == "$v_loc" ]]; then
     echo "Installer script version ${v_loc} matches GitHub (${INSTALLER_GITHUB_REPO}@${INSTALLER_GITHUB_REF})."
+    rm -f "$tmp"
     return 0
   fi
   local newer outdated=0
   newer="$(printf '%s\n' "$v_loc" "$v_rem" | sort -V | tail -n1)"
   if [[ "$newer" == "$v_rem" && "$v_rem" != "$v_loc" ]]; then outdated=1; fi
   if [[ "$outdated" -eq 0 ]]; then
+    rm -f "$tmp"
     return 0
   fi
-  local gh_page="https://github.com/${INSTALLER_GITHUB_REPO}/blob/${INSTALLER_GITHUB_REF}/gentoo_installer.sh"
-  echo "" >&2
-  echo "================================================================" >&2
-  echo "  UPDATE: GitHub has a newer installer (upstream version ${v_rem}; this copy is ${v_loc})." >&2
-  echo "  Page:  ${gh_page}" >&2
-  echo "  Raw:   ${url}" >&2
-  echo "================================================================" >&2
-  echo "" >&2
-  if [[ "$strict" == "YES" ]]; then
-    die "Refusing to run outdated installer (UPSTREAM_STRICT=YES). Refresh gentoo_installer.sh from GitHub or set UPSTREAM_STRICT=NO."
+
+  if [[ "${UPSTREAM_AUTO_UPDATE:-YES}" == "YES" ]]; then
+    installer_self_update_from_tmp "$tmp" "$v_rem" "$argv_ref_name"
+    rm -f "$tmp" 2>/dev/null || true
+    echo "NOTE: Self-update failed (GitHub v${v_rem} > local v${v_loc}). See errors above; continuing with this copy." >&2
+  else
+    rm -f "$tmp"
+    local gh_page="https://github.com/${INSTALLER_GITHUB_REPO}/blob/${INSTALLER_GITHUB_REF}/gentoo_installer.sh"
+    echo "" >&2
+    echo "================================================================" >&2
+    echo "  UPDATE: GitHub has a newer installer (upstream version ${v_rem}; this copy is ${v_loc})." >&2
+    echo "  Page:  ${gh_page}" >&2
+    echo "  Raw:   ${url}" >&2
+    echo "================================================================" >&2
+    echo "" >&2
   fi
-  echo "  Continuing with this file. Set CHECK_UPSTREAM=NO to skip this check." >&2
+  if [[ "$strict" == "YES" ]]; then
+    die "Refusing to run outdated installer (UPSTREAM_STRICT=YES). Fix self-update, refresh manually, or set CHECK_UPSTREAM=NO."
+  fi
+  if [[ "${UPSTREAM_AUTO_UPDATE:-YES}" == "YES" ]]; then
+    echo "  Set CHECK_UPSTREAM=NO to skip the upstream check entirely." >&2
+  else
+    echo "  Set UPSTREAM_AUTO_UPDATE=YES to auto-replace from GitHub, or CHECK_UPSTREAM=NO to skip." >&2
+  fi
   echo "" >&2
 }
 
@@ -1713,6 +1794,7 @@ finish_msg(){
 # =============================================================================
 
 main(){
+  local -a INSTALLER_INVOCATION_ARGV=("$@")
   local RESET=0 RESET_PHASE="" PRINT_ERASE_TOKEN=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1728,13 +1810,13 @@ main(){
   done
 
   need_root
+  check_installer_upstream INSTALLER_INVOCATION_ARGV
   if [[ "$PRINT_ERASE_TOKEN" -eq 1 ]]; then
     need_cmd lsblk
     install_disks_resolve
     printf 'CONFIRM_ERASE=%s\n' "$(confirm_erase_expected)"
     exit 0
   fi
-  check_installer_upstream
   for c in sgdisk mdadm wipefs partprobe udevadm rsync tar mount umount findmnt lsblk mkfs.vfat mkfs.ext4 mktemp yes blockdev wget chroot blkid sed stat grep awk curl dd fallocate mkswap; do
     need_cmd "$c"
   done

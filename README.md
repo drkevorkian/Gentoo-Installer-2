@@ -8,7 +8,12 @@ See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume op
 
 ## Upstream version check
 
-Before other phases (unless **`CHECK_UPSTREAM=NO`**), the script downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares the `# INSTALLER_VERSION=` line to your copy. If GitHub is newer, a warning is printed; **`UPSTREAM_STRICT=YES`** aborts until you refresh the script. Override repo/ref with **`INSTALLER_GITHUB_REPO`** and **`INSTALLER_GITHUB_REF`** if you fork.
+After **`need_root`** (unless **`CHECK_UPSTREAM=NO`**), the script downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** to your copy.
+
+- **`UPSTREAM_AUTO_UPDATE=YES`** (default): if GitHub is newer, the download is validated (**shebang**, **`bash -n`**), **`chmod +x`**, moved over **this script’s path**, and the process **`exec`**s the new file with the **same command-line arguments** (so the run continues with the updated code).
+- **`UPSTREAM_AUTO_UPDATE=NO`**: only print a warning; **`UPSTREAM_STRICT=YES`** then aborts if GitHub is newer.
+
+Override repo/ref with **`INSTALLER_GITHUB_REPO`** and **`INSTALLER_GITHUB_REF`** if you fork. The script directory must be writable for in-place replacement.
 
 ## Requirements
 
@@ -95,8 +100,9 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** using **SHA512** if present, else **SHA256**, else **MD5** (name kept for backward compatibility) |
 | `INSTALL_SERVER_STACK` | `NO` | `YES` installs Apache, MariaDB, PHP, phpMyAdmin, vsftpd (large attack surface; enable only when needed) |
 | `INSTALLER_LIVE_ENV` | `YES` | `YES`: **`swapoff -a`** and stop **all** `/dev/md*` before partitioning (typical LiveCD). `NO`: only unmount **`$TARGET`** and stop **`$MD`** — use on multi-purpose hosts only with care |
-| `CHECK_UPSTREAM` | `YES` | Compare **`# INSTALLER_VERSION=`** to GitHub raw script before install |
-| `UPSTREAM_STRICT` | `NO` | `YES`: exit if GitHub has a higher **`INSTALLER_VERSION`** |
+| `CHECK_UPSTREAM` | `YES` | Compare **`# INSTALLER_VERSION=`** to GitHub raw script before continuing |
+| `UPSTREAM_AUTO_UPDATE` | `YES` | If GitHub is newer: replace this script in place, **`chmod +x`**, **`exec`** same argv |
+| `UPSTREAM_STRICT` | `NO` | `YES`: exit if GitHub is newer and auto-update is off or failed |
 | `INSTALLER_GITHUB_REPO` | `drkevorkian/Gentoo-Installer-2` | **`owner/repo`** for **`raw.githubusercontent.com`** |
 | `INSTALLER_GITHUB_REF` | `main` | Branch or tag name on GitHub |
 
