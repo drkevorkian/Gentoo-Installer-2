@@ -55,9 +55,9 @@ IFS=$'\n\t'
 
 : "${STAGE3:=}"
 : "${STAGE3_FLAVOR_AUTO:=YES}"
-: "${STAGE3_FLAVOR:=systemd}"        # systemd|openrc|hardened-systemd|hardened-openrc (auto overrides when STAGE3_FLAVOR_AUTO=YES)
+: "${STAGE3_FLAVOR:=hardened-openrc}"        # systemd|openrc|hardened-systemd|hardened-openrc (auto overrides when STAGE3_FLAVOR_AUTO=YES)
 : "${STAGE3_AUTOBUILDS_BASE:=https://distfiles.gentoo.org/releases/amd64/autobuilds}"
-: "${INIT_SYSTEM:=systemd}"           # systemd|openrc — must match stage3 tarball / profile init
+: "${INIT_SYSTEM:=openrc}"           # systemd|openrc — must match stage3 tarball / profile init
 : "${STAGE3_VERIFY_MD5:=YES}"       # YES: verify tarball vs mirror ${URL}.DIGESTS (prefers SHA512; MD5 name kept for compat)
 
 # Profile / GUI
@@ -75,7 +75,7 @@ IFS=$'\n\t'
 : "${INPUT_DEVICES:=libinput}"
 
 : "${FIRST_USER_ENABLE:=YES}"
-: "${FIRST_USER_NAME:=sentinel}"
+: "${FIRST_USER_NAME:=owner}"
 : "${FIRST_USER_PASSWORD:=}"         # empty => interactive
 : "${ROOT_PASSWORD:=${FIRST_USER_PASSWORD}}"
 : "${PASSWD_ALWAYS_SET:=YES}"
