@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=5
+# INSTALLER_VERSION=6
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -22,9 +22,146 @@
 # - Prints SAFE TO REBOOT readiness report
 # - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
 # - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
+# - gentoo_installer.conf next to this script: loaded before defaults (env vars win); auto-saved before self-update
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
+
+# One key per line — variables that may be loaded from / saved to GENTOO_INSTALLER_CONF (not INSTALLER_VERSION).
+installer_conf_tracked_keys(){
+  cat <<'KEYS'
+ARMED
+WIPE_DISKS
+DISK_A
+DISK_B
+INSTALL_DISKS
+ROOT_RAID10_LAYOUT
+TARGET
+MD
+ROOT_RAID_LEVEL
+ROOT_FS
+EFI_SIZE_MIB
+SWAP_SIZE_GB
+RESUME
+CONFIRM_ERASE
+STAGE3
+STAGE3_FLAVOR_AUTO
+STAGE3_FLAVOR
+STAGE3_AUTOBUILDS_BASE
+INIT_SYSTEM
+STAGE3_VERIFY_MD5
+PROFILE_TARGET
+GUI_ENABLE
+GUI_FLAVOR
+GUI_ENABLE_NETWORKMANAGER
+MAKE_JOBS_DEFAULT
+NODE_JOBS
+ACCEPT_LICENSE
+VIDEO_CARDS
+INPUT_DEVICES
+FIRST_USER_ENABLE
+FIRST_USER_NAME
+FIRST_USER_GROUPS
+FIRST_USER_SHELL
+SUDO_WHEEL_NOPASSWD
+KERNEL_CMDLINE_OVERRIDE
+AUTO_MERGE_PORTAGE_CFGS
+CONFIG_PROTECT_MASK_PORTAGE
+BREAK_CIRCULAR_DEPS_TIFF_WEBP
+BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE
+INSTALL_FIRMWARE
+INSTALL_SERVER_STACK
+INSTALL_NODE
+GRUB_INSTALL_TO_DISK_B
+GRUB_REMOVABLE
+CHROOT_DEBUG
+CHROOT_TMPDIR
+LOG_DIR
+LOG_BASENAME
+LOG_ROTATE_MB
+RO_CHECK_INTERVAL
+INSTALLER_LIVE_ENV
+INSTALLER_GITHUB_REPO
+INSTALLER_GITHUB_REF
+CHECK_UPSTREAM
+UPSTREAM_AUTO_UPDATE
+UPSTREAM_STRICT
+GENTOO_INSTALLER_CONF
+SAVE_INSTALLER_CONF
+SAVE_INSTALLER_SECRETS
+FIRST_USER_PASSWORD
+ROOT_PASSWORD
+KEYS
+}
+
+installer_conf_key_may_write(){
+  case "$1" in
+    FIRST_USER_PASSWORD|ROOT_PASSWORD)
+      [[ "${SAVE_INSTALLER_SECRETS:-NO}" == "YES" ]] || return 1
+      ;;
+  esac
+  return 0
+}
+
+# Apply $GENTOO_INSTALLER_CONF before TOP CONFIG defaults: lines are VAR=value.
+# Variables already present in the process environment (e.g. VAR=value ./script) are not overridden.
+installer_conf_apply_file(){
+  local f="$1"
+  declare -A __env_lock=() __tk=()
+  local __k __line __rest
+  while IFS= read -r __k; do
+    [[ -z "$__k" ]] && continue
+    __tk["$__k"]=1
+    printenv "$__k" >/dev/null 2>&1 && __env_lock["$__k"]=1
+  done < <(installer_conf_tracked_keys)
+
+  [[ -f "$f" ]] || return 0
+  echo "Loading installer settings from: $f"
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    __line="${__line#"${__line%%[![:space:]]*}"}"
+    [[ -z "$__line" || "$__line" == \#* ]] && continue
+    if [[ "$__line" =~ ^export[[:space:]]+(.+)$ ]]; then
+      __line="${BASH_REMATCH[1]}"
+      __line="${__line#"${__line%%[![:space:]]*}"}"
+    fi
+    [[ "$__line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    __k="${BASH_REMATCH[1]}"
+    __rest="${BASH_REMATCH[2]}"
+    __rest="${__rest#"${__rest%%[![:space:]]*}"}"
+    __rest="${__rest%"${__rest##*[![:space:]]}"}"
+    [[ -n "${__tk[$__k]+x}" ]] || continue
+    [[ -n "${__env_lock[$__k]+x}" ]] && continue
+    # shellcheck disable=SC2086 -- trusted local file; value is the RHS of VAR=value
+    eval "$__k=$__rest"
+  done < "$f"
+}
+
+# Snapshot effective settings before self-update so the new process reloads the same choices.
+installer_conf_save_snapshot(){
+  [[ "${SAVE_INSTALLER_CONF:-YES}" == "YES" ]] || return 0
+  local f="${GENTOO_INSTALLER_CONF:-}"
+  [[ -n "$f" ]] || return 0
+  local tmp="${f}.tmp.$$" __k
+  umask 077
+  {
+    echo "# gentoo_installer.conf — written $(date -Is) before self-update"
+    echo "# Precedence: environment variables override this file; file overrides script defaults."
+    echo "# Passwords omitted unless SAVE_INSTALLER_SECRETS=YES when saving."
+    while IFS= read -r __k; do
+      [[ -z "$__k" ]] && continue
+      installer_conf_key_may_write "$__k" || continue
+      [[ -n "${!__k+x}" ]] || continue
+      printf '%s=%q\n' "$__k" "${!__k}"
+    done < <(installer_conf_tracked_keys)
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  echo "Saved installer settings for next run -> $f"
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+: "${GENTOO_INSTALLER_CONF:=$SCRIPT_DIR/gentoo_installer.conf}"
+installer_conf_apply_file "$GENTOO_INSTALLER_CONF"
 
 # Structure (top to bottom): configs -> logging -> core helpers -> watchdog ->
 #   preflight -> disk/RAID -> stage3/mount/chroot -> package lists ->
@@ -115,12 +252,23 @@ IFS=$'\n\t'
 : "${CHECK_UPSTREAM:=YES}"
 : "${UPSTREAM_AUTO_UPDATE:=YES}"   # YES: replace this script with GitHub copy and exec it (same argv)
 : "${UPSTREAM_STRICT:=NO}"
+: "${SAVE_INSTALLER_CONF:=YES}"       # write gentoo_installer.conf before self-update
+: "${SAVE_INSTALLER_SECRETS:=NO}"     # YES: include passwords in that file (avoid unless you accept the risk)
+
+# So self-update `exec` and any child inherit effective settings (not only env-prefixed invocations).
+installer_conf_export_tracked(){
+  local __k
+  while IFS= read -r __k; do
+    [[ -z "$__k" ]] && continue
+    [[ -n "${!__k+x}" ]] || continue
+    export -- "$__k" 2>/dev/null || export "$__k"
+  done < <(installer_conf_tracked_keys)
+}
+installer_conf_export_tracked
 
 # =============================================================================
 # Logging, paths, and session state
 # =============================================================================
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 auto_pick_log_dir() {
   local -a candidates=("$SCRIPT_DIR" "$SCRIPT_DIR/logs" "$SCRIPT_DIR/../logs" "/tmp")
@@ -242,6 +390,7 @@ installer_self_update_from_tmp(){
     echo "FATAL: Cannot write to ${tdir}; copy the script there manually or run from a writable directory." >&2
     return 1
   }
+  installer_conf_save_snapshot || echo "NOTE: Could not save installer conf snapshot (continuing self-update)." >&2
   chmod a+x "$tmp" || return 1
   if ! mv -f "$tmp" "$target"; then
     echo "FATAL: Could not replace ${target} with new script." >&2

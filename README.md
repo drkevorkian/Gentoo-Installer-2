@@ -10,10 +10,18 @@ See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume op
 
 After **`need_root`** (unless **`CHECK_UPSTREAM=NO`**), the script downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** to your copy.
 
-- **`UPSTREAM_AUTO_UPDATE=YES`** (default): if GitHub is newer, the download is validated (**shebang**, **`bash -n`**), **`chmod +x`**, moved over **this script’s path**, and the process **`exec`**s the new file with the **same command-line arguments** (so the run continues with the updated code).
+- **`UPSTREAM_AUTO_UPDATE=YES`** (default): if GitHub is newer, the download is validated (**shebang**, **`bash -n`**), current settings are written to **`gentoo_installer.conf`** (see below), then **`chmod +x`**, replace-in-place, and **`exec`** with the **same argv** plus inherited environment so the new script reloads your choices.
 - **`UPSTREAM_AUTO_UPDATE=NO`**: only print a warning; **`UPSTREAM_STRICT=YES`** then aborts if GitHub is newer.
 
 Override repo/ref with **`INSTALLER_GITHUB_REPO`** and **`INSTALLER_GITHUB_REF`** if you fork. The script directory must be writable for in-place replacement.
+
+## Persistent settings (`gentoo_installer.conf`)
+
+Beside **`gentoo_installer.sh`** (default path **`$SCRIPT_DIR/gentoo_installer.conf`**, override with **`GENTOO_INSTALLER_CONF`**) you can keep **`VAR=value`** lines for installer options so they survive script replacements.
+
+- **Load order:** that file is read **before** script defaults. Any variable **already set in the environment** (e.g. `INSTALL_DISKS=/dev/nvme0n1 ./gentoo_installer.sh`) **wins** and is not overwritten by the file.
+- **Self-update:** before **`exec`** to a newer GitHub copy, the installer writes the same file (**`SAVE_INSTALLER_CONF=YES`**, default) with **`chmod 600`**, using **`printf '%q'`** quoting. **Password variables are omitted** unless **`SAVE_INSTALLER_SECRETS=YES`** (avoid on shared machines).
+- **Manual edit:** use **`KEY=value`** or **`export KEY=value`**; **`#`** starts a comment line. Only a fixed allowlist of keys is loaded (see **`installer_conf_tracked_keys`** in the script).
 
 ## Requirements
 
@@ -105,6 +113,9 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `UPSTREAM_STRICT` | `NO` | `YES`: exit if GitHub is newer and auto-update is off or failed |
 | `INSTALLER_GITHUB_REPO` | `drkevorkian/Gentoo-Installer-2` | **`owner/repo`** for **`raw.githubusercontent.com`** |
 | `INSTALLER_GITHUB_REF` | `main` | Branch or tag name on GitHub |
+| `GENTOO_INSTALLER_CONF` | *`$SCRIPT_DIR/gentoo_installer.conf`* | Optional settings file (loaded early; snapshot before self-update) |
+| `SAVE_INSTALLER_CONF` | `YES` | Write that file before replacing the script from GitHub |
+| `SAVE_INSTALLER_SECRETS` | `NO` | `YES`: include **`FIRST_USER_PASSWORD`** / **`ROOT_PASSWORD`** in the saved file |
 
 Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at the top of [`gentoo_installer.sh`](gentoo_installer.sh).
 
