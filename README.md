@@ -1,6 +1,8 @@
 # Gentoo UEFI installer
 
-[`gentoo_installer.sh`](gentoo_installer.sh) installs Gentoo with **UEFI**, **ext4** on `/`, optional **mdadm** RAID when multiple disks are listed, optional GUI (Plasma, GNOME, Xfce), and optional server packages. Run it from a live environment as **root**.
+[`gentoo_installer.sh`](gentoo_installer.sh) installs Gentoo with **UEFI**, **ext4** on `/`, optional **mdadm** RAID when multiple disks are listed, optional GUI (Plasma, GNOME, Xfce), and optional server packages (Apache, MariaDB, phpMyAdmin, vsftpd — off by default). Run it from a live environment as **root**.
+
+**Host scope:** Defaults assume a **dedicated install environment** (e.g. official Gentoo LiveCD). See **`INSTALLER_LIVE_ENV`** below; set it to **`NO`** only when you understand the narrower cleanup behavior.
 
 See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume options.
 
@@ -15,9 +17,9 @@ See the script header for **`PROFILE_TARGET`**, **`INIT_SYSTEM`**, and resume op
 
 ### `INSTALL_DISKS`
 
-Space-separated **whole disk** paths (e.g. `/dev/sda /dev/sdb /dev/sdc` or a single `/dev/nvme0n1`).
+Space-separated **whole disk** paths (e.g. `/dev/sda /dev/sdb /dev/sdc` or a single `/dev/nvme0n1`). The script checks **`lsblk` `TYPE=disk`** for each path and rejects partitions and LVM volumes so the GPT layout is applied to the correct device.
 
-- **If empty (default):** the installer uses legacy **`DISK_A`** and **`DISK_B`** (same behavior as older versions: two disks).
+- **If empty (default):** the installer uses legacy **`DISK_A`** and **`DISK_B`**: each path that exists as a **block device** is included (one or two disks). If only **`DISK_A`** exists (common when there is no **`/dev/sdb`**), a single-disk install is used and a **NOTE** is printed. For RAID across specific disks, set **`INSTALL_DISKS`** explicitly.
 - **One disk:** GPT layout is EFI (`EF00`) + Linux root (`8300`) on partition 2. No mdadm array; root is mounted directly. **`ROOT_RAID_LEVEL`** is ignored (a notice is printed if set).
 - **Two or more disks:** each disk gets EFI + Linux RAID (`FD00`) on partition 2; **`mdadm`** builds **`$MD`** (default `/dev/md0`) across **all** disks using **`ROOT_RAID_LEVEL`**.
 
@@ -78,7 +80,7 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 |----------|---------|---------|
 | `ARMED` | `YES` | Must be `YES` |
 | `WIPE_DISKS` | `YES` | Must be `YES` |
-| `INSTALL_DISKS` | *(empty)* | Space-separated disks; empty ⇒ `DISK_A` + `DISK_B` |
+| `INSTALL_DISKS` | *(empty)* | Space-separated disks; empty ⇒ each of `DISK_A`, `DISK_B` that exists as a block device |
 | `DISK_A`, `DISK_B` | `/dev/sda`, `/dev/sdb` | Used only when **`INSTALL_DISKS`** is empty |
 | `CONFIRM_ERASE` | *(empty)* | Must match the **`ERASE-…`** formula above |
 | `ROOT_RAID_LEVEL` | `raid0` | `raid0`–`raid10` for multi-disk |
@@ -87,6 +89,8 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `INIT_SYSTEM` | `systemd` | `systemd` or `openrc` |
 | `PROFILE_TARGET` | `hardened-plasma` | Portage profile selection |
 | `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** |
+| `INSTALL_SERVER_STACK` | `NO` | `YES` installs Apache, MariaDB, PHP, phpMyAdmin, vsftpd (large attack surface; enable only when needed) |
+| `INSTALLER_LIVE_ENV` | `YES` | `YES`: **`swapoff -a`** and stop **all** `/dev/md*` before partitioning (typical LiveCD). `NO`: only unmount **`$TARGET`** and stop **`$MD`** — use on multi-purpose hosts only with care |
 
 Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at the top of [`gentoo_installer.sh`](gentoo_installer.sh).
 
@@ -120,19 +124,33 @@ sudo INSTALL_DISKS="/dev/sda /dev/sdb /dev/sdc" ROOT_RAID_LEVEL=raid5 \
   CONFIRM_ERASE=ERASE-sda-sdb-sdc ARMED=YES WIPE_DISKS=YES ./gentoo_installer.sh
 ```
 
-OpenRC server on two disks:
+OpenRC server on two disks (with optional LAMP / phpMyAdmin stack):
 
 ```bash
-sudo INIT_SYSTEM=openrc PROFILE_TARGET=server \
+sudo INIT_SYSTEM=openrc PROFILE_TARGET=server INSTALL_SERVER_STACK=YES \
   ARMED=YES WIPE_DISKS=YES CONFIRM_ERASE=ERASE-sda-sdb ./gentoo_installer.sh
 ```
 
 ## Limitations
 
-- **Whole-disk paths** only (partition numbers are fixed: EFI `1`, root or RAID member `2`).
+- **Whole-disk paths** only (partition numbers are fixed: EFI `1`, root or RAID member `2`); the script enforces this with **`lsblk`**.
 - **RAID levels** supported are those wired in **`ROOT_RAID_LEVEL`** (0, 1, 4, 5, 6, 10).
-- **CI:** validate installs in your own VM or hardware.
+- **Firmware:** UEFI only (no legacy BIOS boot flow in this script).
+- **Full install validation** is still your responsibility: run in a VM or spare hardware.
 
 ## Resume and reset
 
 State file under the log directory; see **`RESUME`**, **`--reset`**, and **`--reset-phase`** in `main()`.
+
+**Dry helper:** after setting **`INSTALL_DISKS`** (or legacy **`DISK_A`** / **`DISK_B`**) but before a destructive run, print the exact variable assignment (no wiping or downloads beyond disk resolution):
+
+```bash
+sudo ./gentoo_installer.sh --print-erase-token
+# Example output: CONFIRM_ERASE=ERASE-nvme0n1
+```
+
+Prefix the real install command with that line or export it in your shell.
+
+## CI
+
+On push/PR, GitHub Actions runs **`bash -n`** and **shellcheck** on [`gentoo_installer.sh`](gentoo_installer.sh) (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck shell=bash
 # gentoo_installer.sh
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
@@ -8,6 +9,8 @@
 #   server|desktop|gnome|plasma|xfce|hardened|hardened-gnome|hardened-plasma|hardened-xfce
 #
 # Key:
+# - Whole-disk validation (lsblk TYPE=disk) for INSTALL_DISKS / DISK_A|B
+# - INSTALLER_LIVE_ENV=YES (default): preflight stops all md + swapoff -a (LiveCD); NO: only $MD
 # - FULL rerunnable phases via state file
 # - INIT_SYSTEM=systemd|openrc selects stage3, Portage profiles (.../systemd vs .../openrc), and service startup (systemctl vs rc-update)
 # - Stage3 tarball MD5 verified against mirror ${STAGE3}.DIGESTS when STAGE3_VERIFY_MD5=YES
@@ -16,6 +19,7 @@
 # - Forces initramfs output to /boot/initramfs-<kver>.img
 # - Root password defaults to FIRST_USER_PASSWORD
 # - Prints SAFE TO REBOOT readiness report
+# - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -84,7 +88,7 @@ IFS=$'\n\t'
 : "${BREAK_CIRCULAR_DEPS_TIFF_WEBP:=YES}"
 : "${BREAK_CIRCULAR_DEPS_PILLOW_TRUETYPE:=YES}"
 : "${INSTALL_FIRMWARE:=YES}"
-: "${INSTALL_SERVER_STACK:=YES}"
+: "${INSTALL_SERVER_STACK:=NO}"
 : "${INSTALL_NODE:=NO}"
 
 : "${GRUB_INSTALL_TO_DISK_B:=YES}"
@@ -99,6 +103,9 @@ IFS=$'\n\t'
 : "${LOG_BASENAME:=gentoo_install}"
 : "${LOG_ROTATE_MB:=25}"
 : "${RO_CHECK_INTERVAL:=15}"
+
+# YES: aggressive cleanup (swapoff -a, stop all /dev/md*) — intended for Gentoo LiveCD / dedicated install VM only.
+: "${INSTALLER_LIVE_ENV:=YES}"
 
 # =============================================================================
 # Logging, paths, and session state
@@ -209,6 +216,22 @@ backing_physical_disks(){
   _walk "$top"
 }
 
+# Reject partitions/mappers: layout code expects lsblk TYPE=disk whole devices.
+install_disk_assert_whole_disk(){
+  local dev="$1" ty
+  dev="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
+  ty="$(lsblk -ndo TYPE "$dev" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  case "$ty" in
+    disk) return 0 ;;
+    "")
+      die "Cannot determine block type for: $1 (not found or lsblk failed). Use whole-disk paths."
+      ;;
+    *)
+      die "Not a whole disk (lsblk TYPE=$ty): $1 — use e.g. /dev/sda or /dev/nvme0n1, not a partition or LV."
+      ;;
+  esac
+}
+
 # Whole-disk device -> partition path (sda1 vs nvme0n1p1).
 disk_part(){
   local d="$1" num="$2"
@@ -232,7 +255,25 @@ install_disks_resolve(){
       INSTALL_DISK_ARR+=("$tok")
     done
   else
-    INSTALL_DISK_ARR=("$DISK_A" "$DISK_B")
+    # Legacy DISK_A + DISK_B: use each path that is actually a whole-disk node.
+    # Many machines have no /dev/sdb (single disk, NVMe-only, etc.); requiring
+    # both used to fail with "Not a block device: /dev/sdb".
+    local -a legacy=()
+    [[ -n "${DISK_A:-}" && -b "$DISK_A" ]] && legacy+=("$DISK_A")
+    if [[ -n "${DISK_B:-}" && -b "$DISK_B" && "$DISK_B" != "$DISK_A" ]]; then
+      legacy+=("$DISK_B")
+    fi
+    if (( ${#legacy[@]} == 0 )); then
+      echo "No usable DISK_A/DISK_B block devices (DISK_A=${DISK_A:-} DISK_B=${DISK_B:-})." >&2
+      echo "Whole-disk devices on this host (from lsblk):" >&2
+      lsblk -dpno NAME,SIZE,TYPE,MODEL 2>/dev/null | sed 's/^/  /' >&2 || true
+      die "Set INSTALL_DISKS to your target disk(s), e.g. INSTALL_DISKS=/dev/nvme0n1"
+    fi
+    INSTALL_DISK_ARR=("${legacy[@]}")
+    if (( ${#INSTALL_DISK_ARR[@]} == 1 )); then
+      echo "NOTE: INSTALL_DISKS unset; only one of DISK_A/DISK_B exists — using single disk ${INSTALL_DISK_ARR[0]}." >&2
+      echo "      For explicit multi-disk RAID, set INSTALL_DISKS=\"/dev/sdX /dev/sdY ...\"." >&2
+    fi
   fi
   local i j n="${#INSTALL_DISK_ARR[@]}"
   (( n >= 1 )) || die "No disks in INSTALL_DISKS / DISK_A"
@@ -243,6 +284,9 @@ install_disks_resolve(){
     for (( j = i + 1; j < n; j++ )); do
       [[ "${INSTALL_DISK_ARR[i]}" != "${INSTALL_DISK_ARR[j]}" ]] || die "Duplicate disk in list: ${INSTALL_DISK_ARR[i]}"
     done
+  done
+  for (( i = 0; i < n; i++ )); do
+    install_disk_assert_whole_disk "${INSTALL_DISK_ARR[i]}"
   done
   if (( n >= 2 )); then
     INSTALL_ROOT_IS_RAID=1
@@ -507,12 +551,20 @@ require_inputs(){
 preflight_cleanup(){
   phase "preflight_cleanup"
   umount -R "$TARGET" 2>/dev/null || true
-  swapoff -a 2>/dev/null || true
-  for md in /dev/md*; do
-    [[ -b "$md" ]] || continue
-    mdadm --stop "$md" 2>/dev/null || true
-    mdadm --remove "$md" 2>/dev/null || true
-  done
+  if [[ "${INSTALLER_LIVE_ENV:-YES}" == "YES" ]]; then
+    swapoff -a 2>/dev/null || true
+    local md
+    for md in /dev/md*; do
+      [[ -b "$md" ]] || continue
+      mdadm --stop "$md" 2>/dev/null || true
+      mdadm --remove "$md" 2>/dev/null || true
+    done
+  else
+    if [[ -b "${MD:-}" ]]; then
+      mdadm --stop "$MD" 2>/dev/null || true
+      mdadm --remove "$MD" 2>/dev/null || true
+    fi
+  fi
   udevadm settle 2>/dev/null || true
 }
 
@@ -1562,13 +1614,14 @@ finish_msg(){
 # =============================================================================
 
 main(){
-  local RESET=0 RESET_PHASE=""
+  local RESET=0 RESET_PHASE="" PRINT_ERASE_TOKEN=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reset) RESET=1; shift ;;
       --reset-phase) shift; [[ $# -gt 0 ]] || die "--reset-phase requires arg"; RESET_PHASE="$1"; shift ;;
+      --print-erase-token) PRINT_ERASE_TOKEN=1; shift ;;
       -h|--help)
-        echo "Usage: $0 [--reset] [--reset-phase <phase>]"
+        echo "Usage: $0 [--reset] [--reset-phase <phase>] [--print-erase-token]"
         exit 0
         ;;
       *) die "Unknown arg: $1" ;;
@@ -1576,6 +1629,12 @@ main(){
   done
 
   need_root
+  if [[ "$PRINT_ERASE_TOKEN" -eq 1 ]]; then
+    need_cmd lsblk
+    install_disks_resolve
+    printf 'CONFIRM_ERASE=%s\n' "$(confirm_erase_expected)"
+    exit 0
+  fi
   for c in sgdisk mdadm wipefs partprobe udevadm rsync tar mount umount findmnt lsblk mkfs.vfat mkfs.ext4 mktemp yes blockdev wget chroot blkid sed stat grep awk curl dd fallocate mkswap; do
     need_cmd "$c"
   done
