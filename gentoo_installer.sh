@@ -447,9 +447,18 @@ resolve_stage3(){
   local tmp="${STAGE3_CACHE_DIR}/latest-stage3-amd64-${STAGE3_FLAVOR}.txt"
 
   wget -qO "$tmp" "$idx_url" || die "Failed fetching: $idx_url"
+  # Index files are OpenPGP cleartext-signed: first non-metadata line may be
+  # "-----BEGIN PGP SIGNED MESSAGE-----", not the tarball path. Take the first
+  # field that looks like .../stage3-....tar.xz (relative path under autobuilds/).
   local rel
-  rel="$(grep -vE '^(#|$)' "$tmp" | head -n1 | awk '{print $1}')"
-  [[ -n "$rel" ]] || die "Could not parse stage3 path from $idx_url"
+  rel="$(awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    /^-----/ { next }
+    /^Hash:/ { next }
+    $1 ~ /\.tar\.xz$/ { gsub(/\r$/, "", $1); print $1; exit }
+  ' "$tmp")"
+  [[ -n "$rel" ]] || die "Could not parse stage3 path from $idx_url (see $tmp)"
   STAGE3="${STAGE3_AUTOBUILDS_BASE}/${rel}"
 
   echo "INIT_SYSTEM   : ${INIT_SYSTEM}"

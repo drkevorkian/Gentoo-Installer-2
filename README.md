@@ -98,6 +98,8 @@ Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at
 
 When **`STAGE3_VERIFY_MD5=YES`**, the installer downloads **`${STAGE3}.DIGESTS`**, checks **MD5** for the tarball basename, and refuses to extract on mismatch.
 
+Gentoo’s **`latest-stage3-amd64-*.txt`** index files are **OpenPGP cleartext-signed**; the installer skips the armor and comment lines and reads the **`…/stage3-….tar.xz`** path line.
+
 ## Stage3 / `INIT_SYSTEM` consistency
 
 Manual **`STAGE3`** URLs must match **`INIT_SYSTEM`** (openrc vs systemd tarball names). See script **`validate_init_stage3_consistency`**.
