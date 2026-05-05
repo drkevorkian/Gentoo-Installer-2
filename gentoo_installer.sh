@@ -2,6 +2,7 @@
 # shellcheck shell=bash
 # gentoo_installer.sh
 # INSTALLER_VERSION=1.3.5
+# Version = MAJOR.MINOR.PATCH (semver-style): major overhaul · major update · minor update.
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
 # Set INIT_SYSTEM=systemd|openrc; stage3 flavor and profiles follow automatically
@@ -21,7 +22,7 @@
 # - Root password defaults to FIRST_USER_PASSWORD
 # - Prints SAFE TO REBOOT readiness report
 # - --print-erase-token: print CONFIRM_ERASE=ERASE-… only (no install)
-# - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
+# - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= (semver) to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
 # - Self-update runs first at process entry (installer_gate_self_update) before main install flow
 # - gentoo_installer.conf next to this script: loaded before defaults (env vars win); auto-saved before self-update
 #
@@ -247,7 +248,7 @@ installer_conf_apply_file "$GENTOO_INSTALLER_CONF"
 # YES: aggressive cleanup (swapoff -a, stop all /dev/md*) — intended for Gentoo LiveCD / dedicated install VM only.
 : "${INSTALLER_LIVE_ENV:=YES}"
 
-# Upstream copy on GitHub (raw gentoo_installer.sh must carry the same # INSTALLER_VERSION= line).
+# Upstream copy on GitHub (raw gentoo_installer.sh must carry the same # INSTALLER_VERSION= MAJOR.MINOR.PATCH line).
 : "${INSTALLER_GITHUB_REPO:=drkevorkian/Gentoo-Installer-2}"
 : "${INSTALLER_GITHUB_REF:=main}"
 : "${CHECK_UPSTREAM:=YES}"
@@ -342,11 +343,46 @@ need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root"; }
 need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 disk_base(){ basename "$1"; }
 
-# GitHub raw script carries `# INSTALLER_VERSION=N`; bump N when releasing meaningful changes.
+# GitHub raw script carries `# INSTALLER_VERSION=M.m.p` (see header). Bump per release.
 installer_version_from_file(){
   local f="$1"
   grep -m1 '^# INSTALLER_VERSION=' "$f" 2>/dev/null \
     | sed -e 's/^# INSTALLER_VERSION=//' -e 's/[[:space:]]*$//' | tr -d '\r'
+}
+
+# Emit three non-negative integers for ordering (stdout: "maj min pat").
+# Semver: M.m.p or M.m (patch 0). Legacy bare integer N (whole string digits): 0 0 N so 1.x.y is newer than old single-counter releases.
+installer_version_to_triple(){
+  local v="$1"
+  [[ -n "$v" ]] || return 1
+  if [[ "$v" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "0 0 ${v}"
+    return 0
+  fi
+  if [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+    return 0
+  fi
+  if [[ "$v" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} 0"
+    return 0
+  fi
+  return 1
+}
+
+# Exit 0 if v1<v2, 1 if v1==v2, 2 if v1>v2, 3 if either side is unparseable.
+installer_version_compare(){
+  local v1="$1" v2="$2"
+  local ma mi pa nb ni pb
+  read -r ma mi pa <<< "$(installer_version_to_triple "$v1")" || return 3
+  read -r nb ni pb <<< "$(installer_version_to_triple "$v2")" || return 3
+  (( ma < nb )) && return 0
+  (( ma > nb )) && return 2
+  (( mi < ni )) && return 0
+  (( mi > ni )) && return 2
+  (( pa < pb )) && return 0
+  (( pa > pb )) && return 2
+  return 1
 }
 
 # Absolute path to this script file (the path we replace when self-updating).
@@ -452,9 +488,17 @@ check_installer_upstream(){
     rm -f "$tmp"
     return 0
   fi
-  local newer outdated=0
-  newer="$(printf '%s\n' "$v_loc" "$v_rem" | sort -V | tail -n1)"
-  if [[ "$newer" == "$v_rem" && "$v_rem" != "$v_loc" ]]; then outdated=1; fi
+  local outdated=0 cmp_rc
+  installer_version_compare "$v_loc" "$v_rem"
+  cmp_rc=$?
+  if [[ "$cmp_rc" -eq 0 ]]; then
+    outdated=1
+  elif [[ "$cmp_rc" -eq 3 ]]; then
+    echo "NOTE: Could not parse installer versions as semver (local=${v_loc} upstream=${v_rem}); using sort -V fallback." >&2
+    local newer
+    newer="$(printf '%s\n' "$v_loc" "$v_rem" | sort -V | tail -n1)"
+    [[ "$newer" == "$v_rem" && "$v_rem" != "$v_loc" ]] && outdated=1
+  fi
   if [[ "$outdated" -eq 0 ]]; then
     rm -f "$tmp"
     return 0

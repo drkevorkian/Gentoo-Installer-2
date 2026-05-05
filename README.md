@@ -12,8 +12,9 @@ On startup, **`installer_gate_self_update`** runs as soon as the script can (rig
 
 ## Upstream version check
 
-At process entry, **`installer_gate_self_update`** runs **`need_root`** and then (unless **`CHECK_UPSTREAM=NO`**) downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** to your copy.
+At process entry, **`installer_gate_self_update`** runs **`need_root`** and then (unless **`CHECK_UPSTREAM=NO`**) downloads the raw [`gentoo_installer.sh`](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/gentoo_installer.sh) from [**drkevorkian/Gentoo-Installer-2**](https://github.com/drkevorkian/Gentoo-Installer-2) and compares **`# INSTALLER_VERSION=`** (semver **`MAJOR.MINOR.PATCH`**) to your copy.
 
+- **Version line:** **`MAJOR.MINOR.PATCH`** — major overhaul · major update · minor update (e.g. **`1.3.5`**). Older copies that used a **single integer** (digits only) are ordered as **`0.0.N`** for comparison only, so **`1.x.y`** correctly reads as newer than those legacy counters.
 - **`UPSTREAM_AUTO_UPDATE=YES`** (default): if GitHub is newer, the download is validated (**shebang**, **`bash -n`**), current settings are written to **`gentoo_installer.conf`** (see below), then **`chmod +x`**, replace-in-place, and **`exec`** with the **same argv** plus inherited environment so the new script reloads your choices.
 - **`UPSTREAM_AUTO_UPDATE=NO`**: only print a warning; **`UPSTREAM_STRICT=YES`** then aborts if GitHub is newer.
 
@@ -112,7 +113,7 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 | `STAGE3_VERIFY_MD5` | `YES` | Verify stage3 tarball against **`${STAGE3}.DIGESTS`** using **SHA512** if present, else **SHA256**, else **MD5** (name kept for backward compatibility) |
 | `INSTALL_SERVER_STACK` | `NO` | `YES` installs Apache, MariaDB, PHP, phpMyAdmin, vsftpd (large attack surface; enable only when needed) |
 | `INSTALLER_LIVE_ENV` | `YES` | `YES`: **`swapoff -a`** and stop **all** `/dev/md*` before partitioning (typical LiveCD). `NO`: only unmount **`$TARGET`** and stop **`$MD`** — use on multi-purpose hosts only with care |
-| `CHECK_UPSTREAM` | `YES` | Compare **`# INSTALLER_VERSION=`** to GitHub raw script before continuing |
+| `CHECK_UPSTREAM` | `YES` | Compare **`# INSTALLER_VERSION=`** (**semver** **`MAJOR.MINOR.PATCH`**) to GitHub raw script before continuing |
 | `UPSTREAM_AUTO_UPDATE` | `YES` | If GitHub is newer: replace this script in place, **`chmod +x`**, **`exec`** same argv |
 | `UPSTREAM_STRICT` | `NO` | `YES`: exit if GitHub is newer and auto-update is off or failed |
 | `INSTALLER_GITHUB_REPO` | `drkevorkian/Gentoo-Installer-2` | **`owner/repo`** for **`raw.githubusercontent.com`** |
@@ -123,7 +124,7 @@ where basenames are **`basename /dev/...`** for each install disk, sorted **lexi
 
 Further options (GUI, passwords, swap, **`GRUB_INSTALL_TO_DISK_B`**, …) are at the top of [`gentoo_installer.sh`](gentoo_installer.sh).
 
-Bump **`# INSTALLER_VERSION=`** near the top of the script when you publish meaningful changes so the check stays meaningful.
+Bump **`# INSTALLER_VERSION=`** (**`MAJOR.MINOR.PATCH`**) near the top of the script when you release so the upstream check stays meaningful.
 
 ## Download verification
 
