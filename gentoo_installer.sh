@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # gentoo_installer.sh
-# INSTALLER_VERSION=1.3.5
+# INSTALLER_VERSION=1.3.6
 # Version = MAJOR.MINOR.PATCH (semver-style): major overhaul · major update · minor update.
 #
 # Gentoo UEFI installer: one disk (GPT EFI + ext4 root) or N disks with mdadm RAID 0/1/4/5/6/10 (INSTALL_DISKS).
@@ -25,6 +25,8 @@
 # - CHECK_UPSTREAM=YES: compare # INSTALLER_VERSION= (semver) to GitHub; UPSTREAM_AUTO_UPDATE replaces self + exec
 # - Self-update runs first at process entry (installer_gate_self_update) before main install flow
 # - gentoo_installer.conf next to this script: loaded before defaults (env vars win); auto-saved before self-update
+# - Production: session banner in log; INSTALLER_GITHUB_* validated for URL-safe coords; log dir 0700 when under script tree;
+#   FIRST_USER_NAME validated when FIRST_USER_ENABLE=YES
 #
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -290,6 +292,20 @@ if [[ -z "${LOG_DIR}" ]]; then
 fi
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
+# Root-only directory access when logs live beside this script (VM/LiveCD installs still append below /tmp if nothing else is writable).
+installer_log_dir_harden_permissions(){
+  [[ -d "${LOG_DIR:-}" ]] || return 0
+  local lp script_lp
+  lp="$(cd "$LOG_DIR" 2>/dev/null && pwd -P)" || return 0
+  script_lp="$(cd "$SCRIPT_DIR" 2>/dev/null && pwd -P)" || return 0
+  case "$lp" in
+    "$script_lp"|"$script_lp"/*)
+      chmod 700 "$LOG_DIR" 2>/dev/null || true
+      ;;
+  esac
+}
+installer_log_dir_harden_permissions
+
 LOG="${LOG_DIR}/${LOG_BASENAME}.log"
 STATE="${LOG_DIR}/${LOG_BASENAME}.state"
 STAGE3_CACHE_DIR="${LOG_DIR}/stage3-cache"
@@ -399,6 +415,42 @@ installer_self_abspath(){
   printf '%s/%s\n' "$dir" "$(basename "$s")"
 }
 
+# First lines in every log: audit-friendly metadata (no passwords or argv).
+log_installer_session_open(){
+  local uv hv sp
+  uv="$(installer_version_from_file "${BASH_SOURCE[0]}" 2>/dev/null || echo "?")"
+  hv="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "?")"
+  sp="$(installer_self_abspath 2>/dev/null || printf '%s\n' "${BASH_SOURCE[0]}")"
+  echo ""
+  echo "==================== INSTALLER SESSION ===================="
+  echo "INSTALLER_VERSION : ${uv}"
+  echo "Started (UTC)     : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  echo "Started (local)   : $(date -Is)"
+  echo "Host              : ${hv}"
+  echo "Kernel            : $(uname -srmo 2>/dev/null || uname -srvm 2>/dev/null || echo '?')"
+  echo "PID               : $$"
+  echo "Script            : ${sp}"
+  echo "PWD               : $(pwd -P 2>/dev/null || pwd)"
+  echo "LOG               : ${LOG:-}"
+  echo "STATE             : ${STATE:-}"
+  echo "============================================================"
+  echo ""
+}
+log_installer_session_open
+
+# INSTALLER_GITHUB_REPO / REF must be safe for https://raw.githubusercontent.com URLs (supply-chain hygiene).
+installer_github_coords_validate(){
+  local repo="${1:-}" ref="${2:-}"
+  [[ -n "$repo" && -n "$ref" ]] || return 1
+  [[ "$repo" != *..* && "$ref" != *..* ]] || return 1
+  [[ "$repo" != *[[:cntrl:]\ ]* && "$ref" != *[[:cntrl:]\ ]* ]] || return 1
+  [[ "$repo" =~ ^[A-Za-z0-9]([A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/[A-Za-z0-9]([A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$ ]] || return 1
+  [[ ${#repo} -le 201 ]] || return 1
+  [[ "$ref" =~ ^[A-Za-z0-9/_+.-]+$ ]] || return 1
+  [[ ${#ref} -le 256 ]] || return 1
+  return 0
+}
+
 # Validate tmp, chmod +x, mv over running script path, exec with same argv. Does not return on success.
 installer_self_update_from_tmp(){
   local tmp="$1" expect_ver="$2" ref_name="$3"
@@ -444,6 +496,9 @@ installer_self_update_from_tmp(){
 check_installer_upstream(){
   [[ "${CHECK_UPSTREAM:-YES}" == "YES" ]] || return 0
   local argv_ref_name="${1:?check_installer_upstream: missing argv array name}"
+
+  installer_github_coords_validate "${INSTALLER_GITHUB_REPO:-}" "${INSTALLER_GITHUB_REF:-}" \
+    || die "Invalid INSTALLER_GITHUB_REPO or INSTALLER_GITHUB_REF (must be URL-safe owner/repo and ref; no spaces or ..)"
 
   local self url tmp v_loc v_rem strict rc=1 target_dir
   strict="${UPSTREAM_STRICT:-NO}"
@@ -998,12 +1053,23 @@ confirm_destroy(){
   [[ "$ans" == "I_UNDERSTAND" ]] || die "Not confirmed"
 }
 
+validate_first_user_identity(){
+  [[ "${FIRST_USER_ENABLE:-NO}" != "YES" ]] && return 0
+  local n="${FIRST_USER_NAME:-}"
+  [[ -n "$n" ]] || die "FIRST_USER_ENABLE=YES requires FIRST_USER_NAME"
+  [[ "$n" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+    || die "FIRST_USER_NAME must be a POSIX login name (lower case, [a-z_][a-z0-9_-]*): ${n}"
+  (( ${#n} <= 32 )) || die "FIRST_USER_NAME longer than 32 characters"
+}
+
 require_inputs(){
   [[ "${ARMED:-NO}" == "YES" ]] || die "Set ARMED=YES"
   [[ "${WIPE_DISKS:-NO}" == "YES" ]] || die "Set WIPE_DISKS=YES"
   [[ -n "${STAGE3:-}" ]] || die "STAGE3 is empty"
   validate_init_stage3_consistency
   validate_install_disk_policy
+  validate_first_user_identity
+  [[ "${CONFIRM_ERASE:-}" != *$'\n'* ]] || die "CONFIRM_ERASE must be a single line"
   local expect
   expect="$(confirm_erase_expected)"
   [[ "${CONFIRM_ERASE:-}" == "$expect" ]] || die "Set CONFIRM_ERASE=$expect"

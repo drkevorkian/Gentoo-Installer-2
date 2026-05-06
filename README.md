@@ -167,6 +167,17 @@ sudo INIT_SYSTEM=openrc PROFILE_TARGET=server INSTALL_SERVER_STACK=YES \
   ARMED=YES WIPE_DISKS=YES CONFIRM_ERASE=ERASE-sda-sdb ./gentoo_installer.sh
 ```
 
+## Production use
+
+Treat this like **infrastructure automation**, not a casual script:
+
+- **Host:** Run only from a **known-good live image** or locked-down netboot; keep **`INSTALLER_LIVE_ENV=YES`** unless you fully understand **`swapoff`** / **md** cleanup scope on multi-purpose machines.
+- **Supply chain:** Prefer **`UPSTREAM_AUTO_UPDATE=YES`** with your fork (**`INSTALLER_GITHUB_REPO`** / **`INSTALLER_GITHUB_REF`** are validated for URL-safe characters). For frozen environments use **`CHECK_UPSTREAM=NO`** or **`UPSTREAM_AUTO_UPDATE=NO`** and **`UPSTREAM_STRICT=YES`** after you pin a reviewed copy.
+- **Audit:** Every run opens the log with an **installer session** header (version, host, time, paths). **`LOG`** / **`STATE`** are **`0600`**; when **`LOG_DIR`** sits under the script directory tree it is forced to **`0700`**.
+- **CONFIRM_ERASE:** Always derive it from **`--print-erase-token`** (or the documented formula); never paste untrusted text (embedded newlines are rejected).
+- **Accounts:** With **`FIRST_USER_ENABLE=YES`**, **`FIRST_USER_NAME`** must be a **POSIX login name** (lowercase **`[a-z_][a-z0-9_-]*`**, max 32 chars).
+- **Evidence:** Archive **`LOG`** and **`STATE`** with change tickets; **`RESUME`** / **`--reset-phase`** are for controlled reruns after fixing failures.
+
 ## Limitations
 
 - **Line endings:** If you edit this repo on Windows, keep **`gentoo_installer.sh`** checked out with **LF** (not CRLF). The installer strips carriage returns from chroot heredocs, but the main script itself should be LF-only on the LiveCD.
@@ -191,4 +202,4 @@ Prefix the real install command with that line or export it in your shell.
 
 ## CI
 
-On push/PR, GitHub Actions runs **`bash -n`** and **shellcheck** on [`gentoo_installer.sh`](gentoo_installer.sh) (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+On push/PR, GitHub Actions runs **`bash -n`**, a **`--help`** smoke check, and **shellcheck** on [`gentoo_installer.sh`](gentoo_installer.sh) (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
