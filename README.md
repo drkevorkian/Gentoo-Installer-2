@@ -1,5 +1,5 @@
 # Gentoo UEFI installer
-
+![Gentoo OpenRC Img](https://github.com/drkevorkian/Gentoo-Installer-2/blob/main/Screenshot_20260721_191313.png)
 [`gentoo_installer.sh`](gentoo_installer.sh) installs Gentoo with **UEFI**, **ext4** on `/`, optional **mdadm** RAID when multiple disks are listed, optional GUI (Plasma, GNOME, Xfce), and optional server packages (Apache, MariaDB, phpMyAdmin, vsftpd — off by default). Run it from a live environment as **root**.
 
 **Host scope:** Defaults assume a **dedicated install environment** (e.g. official Gentoo LiveCD). See **`INSTALLER_LIVE_ENV`** below; set it to **`NO`** only when you understand the narrower cleanup behavior.
